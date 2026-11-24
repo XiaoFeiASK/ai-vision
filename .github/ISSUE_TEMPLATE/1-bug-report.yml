@@ -1,0 +1,48 @@
+name: Bug report
+description: Help us reproduce a problem in AI Vision.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        English and Chinese are welcome. Use a title that names the affected action and symptom.
+        Share sanitized evidence. Report vulnerabilities through the [security reporting guidance](https://github.com/antgroup/ai-vision/security/policy).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Expected and actual behavior
+      description: Name the page, command, or integration and describe the expected result and what you actually observed.
+      placeholder: |
+        Expected result
+        Actual result and user impact
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest sequence of commands or UI actions. For intermittent problems, include the conditions and frequency you observed.
+      placeholder: |
+        1. Open the affected page or run the command.
+        2. Describe the input or state that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and actual version
+      description: Include the actual version when available. Mark any value you could not verify as unknown.
+      placeholder: |
+        Component or integration:
+        Deployment method, OS, and architecture:
+        Version, image tag or digest, or source commit:
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Optionally add relevant logs, error output, screenshots, or a small example. Remove credentials, personal information, private traces, and business prompts.
+    validations:
+      required: false

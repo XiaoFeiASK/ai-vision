@@ -1,0 +1,10 @@
+Bundled models.dev catalog
+
+Source: https://models.dev/api.json
+Project: https://github.com/anomalyco/models.dev
+Retrieved: 2026-11-20
+Uncompressed SHA-256:
+93be3a1c7515ebd1704a87811cd47905187123b8eee1fa9a1d1eefcc151c1d5e
+
+The sole ZIP member, api.json, is byte-for-byte the upstream response.
+The models.dev MIT license is included as models-dev-LICENSE.

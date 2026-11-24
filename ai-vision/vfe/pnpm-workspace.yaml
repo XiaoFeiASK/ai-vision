@@ -1,0 +1,10 @@
+packages:
+  - '.'
+allowBuilds:
+  core-js: false
+  esbuild: true
+  msw: false
+
+overrides:
+  # Newer releases of these consumers still resolve minimatch 10.
+  'minimatch@10': '11.0.1'
