@@ -668,7 +668,7 @@ aiv query trace list --help  # Flags for a specific operation
 | `status` | Per-component state + health table, with endpoints. |
 | `logs <component>` | Tail a component's logs (`-n LINES`, `-f`, `-F` or `--follow` to follow); flags can go before or after the component. |
 | `redeploy` | `destroy` (keep data) then `cast` — rebuild a running stack. |
-| `destroy` | Stop processes, remove containers. `--purge` also wipes data + state. |
+| `destroy` | Stop processes, remove containers. `--purge` also wipes data + state; `--purge-repos` deletes only repos `aiv` cloned. |
 | `gen` | Write the built-in blueprint to a file so you can edit it. |
 | `version` | Print the `aiv` version. |
 

@@ -149,6 +149,9 @@ func buildApp(g *globalOpts) (*runtime.App, error) {
 	if g.workdir != "" {
 		bp.Config.Workdir = g.workdir
 	}
+	if err := blueprint.ValidateNamespace(bp.Metadata.Namespace); err != nil {
+		return nil, err
+	}
 	bp.Config.Vars = components.NormalizeVars(bp.Config.Vars)
 	savedOnly := false
 	if g.observeSaved {
@@ -454,7 +457,7 @@ func cmdDestroy(args []string) error {
 	g := registerGlobal(fs)
 	registerTarget(fs, g)
 	purge := fs.Bool("purge", false, "Docker: remove datastores/state; Compose: remove named volumes, retaining bind-mounted metadata and identity")
-	purgeRepos := fs.Bool("purge-repos", false, "also delete cloned source repos (implies --purge)")
+	purgeRepos := fs.Bool("purge-repos", false, "also delete source repos aiv cloned (implies --purge)")
 	yes := fs.Bool("y", false, "skip the confirmation prompt")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -496,6 +499,9 @@ func cmdDestroy(args []string) error {
 	opts := runtime.DestroyOpts{Purge: *purge || *purgeRepos, PurgeRepos: *purgeRepos}
 	if !*yes {
 		warn := "This stops all AI Vision components in namespace '" + app.BP.Metadata.Namespace + "'."
+		if opts.Purge {
+			warn += "\n  State directory to delete: " + app.State.Root
+		}
 		if useCompose && opts.Purge {
 			warn += "\n  --purge ALSO deletes this Compose project's named volumes: DATA WILL BE LOST."
 			warn += "\n  Bind-mounted metastore, deployment identity and private configuration are retained. External databases are not touched."
@@ -505,7 +511,18 @@ func cmdDestroy(args []string) error {
 			warn += "\n  --purge ALSO deletes local state. The external OceanBase at " + app.Vars["OB_HOST"] + " is NOT touched."
 		}
 		if opts.PurgeRepos {
-			warn += "\n  --purge-repos ALSO deletes cloned source repos."
+			repos, err := app.State.ManagedRepos()
+			if err != nil {
+				return err
+			}
+			if len(repos) == 0 {
+				warn += "\n  --purge-repos: no aiv-cloned repos recorded; pre-existing checkouts will be kept."
+			} else {
+				warn += "\n  --purge-repos ALSO deletes these aiv-cloned repos:"
+				for _, dir := range repos {
+					warn += "\n    " + dir
+				}
+			}
 		}
 		fmt.Fprintln(os.Stderr, warn)
 		fmt.Fprint(os.Stderr, "Continue? [y/N] ")

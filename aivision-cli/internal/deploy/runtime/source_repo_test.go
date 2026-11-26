@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -44,5 +45,45 @@ func TestForceSourceFetchRequiresConfiguredOrigin(t *testing.T) {
 	component.Repo.URL = origin
 	if err := app.gitCloneOrFetch(component); err != nil {
 		t.Fatalf("forced source fetch with the configured origin failed: %v", err)
+	}
+}
+
+func TestCloneRecordsManagedRepo(t *testing.T) {
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin")
+	runGit := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("-c", "init.defaultBranch=main", "init", "--quiet", origin)
+	runGit("-C", origin, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+		"commit", "--quiet", "--allow-empty", "-m", "initial source")
+
+	sourceRoot := filepath.Join(root, "src")
+	workdir := filepath.Join(root, "work")
+	app := &App{
+		Log:   NewLogger(false),
+		Ctx:   context.Background(),
+		State: NewState(workdir, "aivision"),
+		Vars:  map[string]string{"SOURCE_ROOT": sourceRoot},
+	}
+	component := Component{Name: "backend", Repo: &blueprint.Repo{URL: origin, Branch: "main", Path: "backend"}}
+	if err := app.gitCloneOrFetch(component); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(sourceRoot, "backend")
+	if len(repos) != 1 || repos[0] != want {
+		t.Fatalf("managed repos = %v, want [%s]", repos, want)
+	}
+	if _, err := os.Stat(filepath.Join(want, ".git")); err != nil {
+		t.Fatalf("clone was not created: %v", err)
 	}
 }

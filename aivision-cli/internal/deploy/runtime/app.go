@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
 // App is the shared execution context threaded through every command.
@@ -304,7 +306,20 @@ git fetch --prune origin && git checkout %s && git reset --hard origin/%s`,
 		return err
 	}
 	script := fmt.Sprintf("git clone --branch %s %s %s", shq(branch), shq(url), shq(dir))
-	return a.Log.RunShell(a.Ctx, script, RunOpts{Stream: a.Verbose})
+	if err := a.Log.RunShell(a.Ctx, script, RunOpts{Stream: a.Verbose}); err != nil {
+		return err
+	}
+	if a.State == nil {
+		return nil
+	}
+	if err := pathguard.EnsureWithin(a.SourceRoot(), dir); err != nil {
+		a.Log.Warn("cloned %s outside sourceRoot; --purge-repos will keep it: %v", dir, err)
+		return nil
+	}
+	if err := a.State.RecordManagedRepo(dir); err != nil {
+		return fmt.Errorf("record cloned repo %s: %w", dir, err)
+	}
+	return nil
 }
 
 // ResolveEnv builds a component's effective environment: values loaded from

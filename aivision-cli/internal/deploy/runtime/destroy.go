@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
 // DestroyOpts controls teardown scope.
@@ -23,6 +25,15 @@ func (a *App) Destroy(opts DestroyOpts) error {
 		return err
 	}
 	a.Log.Step("destroy: tearing down namespace %s (purge=%v)", a.BP.Metadata.Namespace, opts.Purge)
+
+	var managedRepos []string
+	if opts.PurgeRepos {
+		var err error
+		managedRepos, err = a.purgeRepoTargets()
+		if err != nil {
+			return err
+		}
+	}
 
 	comps := a.BP.OrderedComponents()
 	// reverse order: dependents first
@@ -89,27 +100,68 @@ func (a *App) Destroy(opts DestroyOpts) error {
 	if opts.Purge {
 		a.Log.Info("purging state dir %s", a.State.Root)
 		if err := a.State.RemoveAll(); err != nil {
-			a.Log.Warn("remove state: %v", err)
+			return fmt.Errorf("remove state: %w", err)
 		}
 	}
 	if opts.PurgeRepos {
-		for _, c := range rev {
-			if c.Repo == nil {
-				continue
-			}
-			dir := a.RepoDir(c)
-			if dir == "" || dir == a.SourceRoot() {
-				continue
-			}
-			if _, err := os.Stat(dir); err == nil {
-				a.Log.Info("removing repo %s", dir)
-				if err := os.RemoveAll(dir); err != nil {
-					a.Log.Warn("remove repo %s: %v", dir, err)
-				}
-			}
+		if err := a.removeManagedRepos(managedRepos); err != nil {
+			return err
 		}
 	}
 	a.Log.OK("destroy complete")
+	return nil
+}
+
+// purgeRepoTargets validates every repository path before anything is deleted
+// and returns the checkouts aiv itself cloned. Blueprint paths outside
+// sourceRoot and stale records are rejected, not silently skipped.
+func (a *App) purgeRepoTargets() ([]string, error) {
+	for _, c := range a.BP.Components {
+		if c.Repo == nil {
+			continue
+		}
+		dir := a.RepoDir(c)
+		if dir == "" {
+			continue
+		}
+		if err := pathguard.EnsureWithin(a.SourceRoot(), dir); err != nil {
+			return nil, fmt.Errorf("component %q: refusing --purge-repos: %w", c.Name, err)
+		}
+	}
+	repos, err := a.State.ManagedRepos()
+	if err != nil {
+		return nil, fmt.Errorf("read recorded repos: %w", err)
+	}
+	for _, dir := range repos {
+		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
+			return nil, fmt.Errorf("refusing to delete recorded repo: %w", err)
+		}
+	}
+	return repos, nil
+}
+
+// removeManagedRepos deletes only checkouts aiv cloned. Pre-existing local
+// workspaces are never removed, even when they match a blueprint repo.path.
+func (a *App) removeManagedRepos(repos []string) error {
+	if len(repos) == 0 {
+		a.Log.Info("no aiv-cloned repos recorded; pre-existing checkouts are kept")
+		return nil
+	}
+	for _, dir := range repos {
+		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
+			return fmt.Errorf("refusing to delete repo: %w", err)
+		}
+		if _, err := os.Lstat(dir); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("inspect repo %s: %w", dir, err)
+		}
+		a.Log.Info("removing aiv-cloned repo %s", dir)
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("remove repo %s: %w", dir, err)
+		}
+	}
 	return nil
 }
 

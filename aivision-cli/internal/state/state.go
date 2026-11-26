@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/antgroup/ai-vision/aivision-cli/internal/blueprint"
+	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
 // State tracks everything aiv persists about a deployment so that status,
 // logs and destroy can operate even when the blueprint is not at hand.
 type State struct {
 	Namespace   string
+	Workdir     string // resolved workdir; Root must stay strictly inside it
 	Root        string // <workdir>/<namespace>
 	StateDir    string // Root/state
 	LogDir      string // Root/logs
@@ -39,9 +41,11 @@ type DeployMeta struct {
 }
 
 func NewState(workdir, namespace string) *State {
-	root := filepath.Join(blueprint.CleanPath(workdir, nil), namespace)
+	workdir = blueprint.CleanPath(workdir, nil)
+	root := filepath.Join(workdir, namespace)
 	return &State{
 		Namespace:   namespace,
+		Workdir:     workdir,
 		Root:        root,
 		StateDir:    filepath.Join(root, "state"),
 		LogDir:      filepath.Join(root, "logs"),
@@ -185,7 +189,65 @@ func (s *State) LoadVars() (map[string]string, error) {
 	return out, nil
 }
 
-// RemoveAll deletes the entire namespace state root (destroy --purge).
+// RemoveAll deletes the entire namespace state root (destroy --purge). The
+// root must be a real child of the configured workdir, so a namespace such as
+// "..", "." or an absolute path can never widen the delete.
 func (s *State) RemoveAll() error {
+	if s.Workdir == "" {
+		return fmt.Errorf("refusing to purge %s: state root has no workdir", s.Root)
+	}
+	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.Root); err != nil {
+		return fmt.Errorf("refusing to purge state dir: %w", err)
+	}
 	return os.RemoveAll(s.Root)
+}
+
+// reposFile lists source checkouts that aiv cloned itself. destroy
+// --purge-repos only removes entries recorded here, never a pre-existing
+// checkout that merely matched a blueprint repo.path.
+func (s *State) reposFile() string { return filepath.Join(s.StateDir, "repos.json") }
+
+// ManagedRepos returns the recorded aiv-cloned repositories.
+func (s *State) ManagedRepos() ([]string, error) {
+	b, err := os.ReadFile(s.reposFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var repos []string
+	if err := json.Unmarshal(b, &repos); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", s.reposFile(), err)
+	}
+	return repos, nil
+}
+
+// RecordManagedRepo marks dir as cloned by aiv so a later --purge-repos can
+// delete it. Paths outside sourceRoot are not recorded; destroy refuses them
+// even if a stale record exists.
+func (s *State) RecordManagedRepo(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	abs = filepath.Clean(abs)
+	repos, err := s.ManagedRepos()
+	if err != nil {
+		return err
+	}
+	for _, repo := range repos {
+		if repo == abs {
+			return nil
+		}
+	}
+	repos = append(repos, abs)
+	if err := os.MkdirAll(s.StateDir, 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(repos, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.reposFile(), b, 0o644)
 }
