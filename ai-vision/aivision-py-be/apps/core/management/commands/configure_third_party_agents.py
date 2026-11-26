@@ -28,8 +28,8 @@ def installation_guide(plugin):
     ]
     if not plugin.get("binary"):
         requirements.append({"label": "Node.js", "value": "已安装"})
-    # The native Windows client does not support agent installation. The
-    # browser fills in the macOS/Linux command's placeholders after authorization.
+    # The browser fills in the command's placeholders after authorization.
+    # The published Windows remote client does not support aiv connect.
     # --base-url is anchored to the SAME origin the onboarding catalog serves
     # its plugin downloads from (public_base_url): the installer enforces a
     # same-origin check on the artifact URL, so the browser origin (the vite
@@ -47,7 +47,7 @@ def installation_guide(plugin):
     restart = f"重启 {plugin['name']}"
     if plugin["key"] == "codex":
         restart += "，输入 /hooks 检查并信任新增的 AI Vision hooks"
-    return {
+    guide = {
         "schema": "v2",
         "plugin_key": plugin["key"],
         "sections": [
@@ -83,6 +83,9 @@ def installation_guide(plugin):
         ],
         "success_message": "请在 Agent 所在机器安装采集插件，运行任务后到数据看板查看上报结果。",
     }
+    if plugin.get("host"):
+        guide["host"] = plugin["host"]
+    return guide
 
 
 def plugin_config_guide(plugin):

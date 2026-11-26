@@ -272,11 +272,12 @@ class ThirdPartyOnboardingTests(SpaceKeyTestCase):
         ):
             if kind.setup_mode != "CLI":
                 continue
-            command = next(
+            platforms = next(
                 section
                 for section in kind.config_guide["sections"]
                 if section["type"] == "setup_steps"
-            )["platforms"]["macOS/Linux"]["modes"]["cli"]["steps"][0]["command"]
+            )["platforms"]
+            command = platforms["macOS/Linux"]["modes"]["cli"]["steps"][0]["command"]
             self.assertIn("--base-url 'http://127.0.0.1:8001'", command)
             self.assertNotIn("{baseUrl}", command)
 
