@@ -15,10 +15,11 @@ import (
 )
 
 // namespacePattern keeps metadata.namespace to one safe path component while
-// still accepting the '_' and '.' characters Docker and Compose allow. The
-// first character must be alphanumeric, which rejects ".", ".." and hidden
-// names; separators, absolute paths and backslashes are rejected as well.
-var namespacePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`)
+// accepting every selector Docker and Compose already allow, including
+// uppercase Docker names and trailing '-' or '_'. The first character must be
+// alphanumeric, which rejects ".", ".." and hidden names; separators,
+// absolute paths and backslashes are rejected as well.
+var namespacePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // ValidateNamespace rejects namespace values that could escape the workdir or
 // are unusable as a Docker, Compose or Kubernetes name.
@@ -26,11 +27,8 @@ func ValidateNamespace(namespace string) error {
 	if namespace == "" {
 		return fmt.Errorf("metadata.namespace must not be empty")
 	}
-	if len(namespace) > 63 {
-		return fmt.Errorf("metadata.namespace %q is longer than 63 characters", namespace)
-	}
 	if !namespacePattern.MatchString(namespace) {
-		return fmt.Errorf("metadata.namespace %q must start and end with a letter or digit and contain only lowercase letters, digits, '.', '_' or '-'", namespace)
+		return fmt.Errorf("metadata.namespace %q must start with a letter or digit and contain only letters, digits, '.', '_' or '-'", namespace)
 	}
 	return nil
 }

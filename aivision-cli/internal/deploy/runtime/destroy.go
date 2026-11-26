@@ -24,9 +24,14 @@ func (a *App) Destroy(opts DestroyOpts) error {
 	if err := a.checkDeploymentDriver(); err != nil {
 		return err
 	}
+	if opts.Purge {
+		if err := a.State.VerifyPurgeTarget(); err != nil {
+			return fmt.Errorf("remove state: %w", err)
+		}
+	}
 	a.Log.Step("destroy: tearing down namespace %s (purge=%v)", a.BP.Metadata.Namespace, opts.Purge)
 
-	var managedRepos []string
+	var managedRepos []ManagedRepo
 	if opts.PurgeRepos {
 		var err error
 		managedRepos, err = a.purgeRepoTargets()
@@ -97,15 +102,15 @@ func (a *App) Destroy(opts DestroyOpts) error {
 		}
 	}
 
+	if opts.PurgeRepos {
+		if err := a.removeManagedRepos(managedRepos); err != nil {
+			return err
+		}
+	}
 	if opts.Purge {
 		a.Log.Info("purging state dir %s", a.State.Root)
 		if err := a.State.RemoveAll(); err != nil {
 			return fmt.Errorf("remove state: %w", err)
-		}
-	}
-	if opts.PurgeRepos {
-		if err := a.removeManagedRepos(managedRepos); err != nil {
-			return err
 		}
 	}
 	a.Log.OK("destroy complete")
@@ -114,8 +119,9 @@ func (a *App) Destroy(opts DestroyOpts) error {
 
 // purgeRepoTargets validates every repository path before anything is deleted
 // and returns the checkouts aiv itself cloned. Blueprint paths outside
-// sourceRoot and stale records are rejected, not silently skipped.
-func (a *App) purgeRepoTargets() ([]string, error) {
+// sourceRoot are rejected; unusable ownership records are skipped so they
+// cannot block cleanup of other eligible checkouts.
+func (a *App) purgeRepoTargets() ([]ManagedRepo, error) {
 	for _, c := range a.BP.Components {
 		if c.Repo == nil {
 			continue
@@ -132,34 +138,58 @@ func (a *App) purgeRepoTargets() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read recorded repos: %w", err)
 	}
-	for _, dir := range repos {
-		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
-			return nil, fmt.Errorf("refusing to delete recorded repo: %w", err)
+	eligible := make([]ManagedRepo, 0, len(repos))
+	for _, repo := range repos {
+		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), repo.Path); err != nil {
+			a.Log.Warn("keeping recorded repo %s: %v", repo.Path, err)
+			continue
 		}
+		if repo.ID == "" {
+			a.Log.Warn("keeping recorded repo %s: no verified ownership id", repo.Path)
+			continue
+		}
+		eligible = append(eligible, repo)
 	}
-	return repos, nil
+	return eligible, nil
 }
 
 // removeManagedRepos deletes only checkouts aiv cloned. Pre-existing local
-// workspaces are never removed, even when they match a blueprint repo.path.
-func (a *App) removeManagedRepos(repos []string) error {
+// workspaces are never removed, even when they match a blueprint repo.path,
+// because the ownership marker must still match the recorded id.
+func (a *App) removeManagedRepos(repos []ManagedRepo) error {
 	if len(repos) == 0 {
 		a.Log.Info("no aiv-cloned repos recorded; pre-existing checkouts are kept")
 		return nil
 	}
-	for _, dir := range repos {
+	for _, repo := range repos {
+		dir := repo.Path
 		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
 			return fmt.Errorf("refusing to delete repo: %w", err)
 		}
 		if _, err := os.Lstat(dir); err != nil {
 			if os.IsNotExist(err) {
+				if err := a.State.ForgetManagedRepo(dir); err != nil {
+					return fmt.Errorf("forget removed repo %s: %w", dir, err)
+				}
 				continue
 			}
 			return fmt.Errorf("inspect repo %s: %w", dir, err)
 		}
+		id, err := repoOwnerID(dir)
+		if err != nil {
+			a.Log.Warn("keeping repo %s: %v", dir, err)
+			continue
+		}
+		if id != repo.ID {
+			a.Log.Warn("keeping repo %s: ownership id does not match the record", dir)
+			continue
+		}
 		a.Log.Info("removing aiv-cloned repo %s", dir)
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("remove repo %s: %w", dir, err)
+		}
+		if err := a.State.ForgetManagedRepo(dir); err != nil {
+			return fmt.Errorf("forget removed repo %s: %w", dir, err)
 		}
 	}
 	return nil

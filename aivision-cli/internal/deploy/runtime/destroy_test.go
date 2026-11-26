@@ -35,7 +35,27 @@ func newDestroyTestApp(t *testing.T, workdir, sourceRoot string, repos ...Repo) 
 	}
 }
 
-func TestDestroyPurgeRefusesStateRootOutsideWorkdir(t *testing.T) {
+// makeClone creates a checkout with the ownership marker aiv writes after a
+// successful clone and records it with the given id.
+func makeClone(t *testing.T, app *App, dir, recordedID, markerID string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file"), []byte("cloned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRepoOwner(dir, markerID); err != nil {
+		t.Fatal(err)
+	}
+	if recordedID != "" {
+		if err := app.State.RecordManagedRepo(dir, recordedID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDestroyPurgeValidatesStateBeforeTeardown(t *testing.T) {
 	workdir := filepath.Join(t.TempDir(), "work")
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
 		t.Fatal(err)
@@ -44,11 +64,16 @@ func TestDestroyPurgeRefusesStateRootOutsideWorkdir(t *testing.T) {
 	if err := os.MkdirAll(victim, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	teardownRan := filepath.Join(t.TempDir(), "teardown-ran")
 	app := newDestroyTestApp(t, workdir, t.TempDir())
+	app.BP.Components[0].Teardown = []Step{{Shell: "touch " + teardownRan}}
 	app.State = NewState(workdir, "..")
 
 	if err := app.Destroy(DestroyOpts{Purge: true}); err == nil {
 		t.Fatal("destroy --purge accepted a state root outside workdir")
+	}
+	if _, err := os.Stat(teardownRan); !os.IsNotExist(err) {
+		t.Fatalf("teardown ran before the state purge target was validated: %v", err)
 	}
 	if _, err := os.Stat(victim); err != nil {
 		t.Fatalf("directory outside workdir was removed: %v", err)
@@ -77,7 +102,7 @@ func TestDestroyPurgeReposKeepsPreExistingCheckout(t *testing.T) {
 	}
 }
 
-func TestDestroyPurgeReposRefusesReposOutsideSourceRoot(t *testing.T) {
+func TestDestroyPurgeReposRefusesBlueprintReposOutsideSourceRoot(t *testing.T) {
 	workdir := t.TempDir()
 	base := t.TempDir()
 	sourceRoot := filepath.Join(base, "src")
@@ -105,43 +130,106 @@ func TestDestroyPurgeReposRefusesReposOutsideSourceRoot(t *testing.T) {
 	}
 }
 
-func TestDestroyPurgeReposDeletesRecordedCloneOnly(t *testing.T) {
+func TestDestroyPurgeReposDeletesVerifiedClone(t *testing.T) {
 	sourceRoot := t.TempDir()
 	cloned := filepath.Join(sourceRoot, "cloned")
-	if err := os.MkdirAll(cloned, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cloned, "file"), []byte("cloned"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
-	if err := app.State.RecordManagedRepo(cloned); err != nil {
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("verified aiv clone still exists: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("records after purge = %v, %v", repos, err)
+	}
+}
+
+func TestDestroyPurgeReposKeepsCheckoutWithMismatchedOwner(t *testing.T) {
+	sourceRoot := t.TempDir()
+	replaced := filepath.Join(sourceRoot, "replaced")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "replaced"})
+	makeClone(t, app, replaced, "expected-id", "different-id")
+
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(replaced, "file")); err != nil {
+		t.Fatalf("checkout with mismatched ownership was removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposSkipsUnusableRecordsAndCleansOthers(t *testing.T) {
+	workdir := t.TempDir()
+	sourceRoot := t.TempDir()
+	app := newDestroyTestApp(t, workdir, sourceRoot)
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	makeClone(t, app, outside, "outside-id", "outside-id")
+	makeClone(t, app, sourceRoot, "root-id", "root-id")
+	valid := filepath.Join(sourceRoot, "valid")
+	makeClone(t, app, valid, "valid-id", "valid-id")
+
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("record outside sourceRoot was removed: %v", err)
+	}
+	if _, err := os.Stat(sourceRoot); err != nil {
+		t.Fatalf("sourceRoot itself was removed: %v", err)
+	}
+	if _, err := os.Stat(valid); !os.IsNotExist(err) {
+		t.Fatalf("eligible clone was not removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeOnlyKeepsRepoRecords(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+
+	if err := app.Destroy(DestroyOpts{Purge: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cloned, "file")); err != nil {
+		t.Fatalf("state-only purge removed the clone: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != cloned {
+		t.Fatalf("records after state-only purge = %v, %v", repos, err)
 	}
 
 	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
-		t.Fatalf("recorded aiv clone still exists: %v", err)
+		t.Fatalf("clone was not removed by the retry: %v", err)
 	}
 }
 
-func TestDestroyPurgeReposRejectsStaleRecordOutsideSourceRoot(t *testing.T) {
+func TestDestroyPurgeReposKeepsRecordWhenRemovalFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based removal failure does not apply to root")
+	}
 	sourceRoot := t.TempDir()
-	victim := filepath.Join(t.TempDir(), "victim")
-	if err := os.MkdirAll(victim, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	app := newDestroyTestApp(t, t.TempDir(), sourceRoot)
-	if err := app.State.RecordManagedRepo(victim); err != nil {
-		t.Fatal(err)
-	}
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
 
-	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err == nil {
-		t.Fatal("destroy accepted a recorded repo outside sourceRoot")
+	if err := os.Chmod(sourceRoot, 0o555); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(victim); err != nil {
-		t.Fatalf("recorded path outside sourceRoot was removed: %v", err)
+	t.Cleanup(func() { _ = os.Chmod(sourceRoot, 0o755) })
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err == nil {
+		t.Fatal("destroy reported success after the repo removal failed")
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != cloned {
+		t.Fatalf("failed cleanup did not retain its record: %v, %v", repos, err)
 	}
 }

@@ -21,11 +21,19 @@ components:
 		t.Fatal(err)
 	}
 
-	for _, namespace := range []string{".", "..", "../victim", "/absolute", `..\victim`, "Upper", "a/b"} {
+	for _, namespace := range []string{".", "..", "../victim", "/absolute", `..\victim`, "a/b", "_hidden"} {
 		t.Run(namespace, func(t *testing.T) {
 			if _, err := buildApp(&globalOpts{file: bpPath, namespace: namespace}); err == nil {
 				t.Fatalf("buildApp accepted namespace %q", namespace)
 			}
 		})
+	}
+
+	app, err := buildApp(&globalOpts{file: bpPath, namespace: "existing_"})
+	if err != nil {
+		t.Fatalf("existing Compose-compatible selector was rejected: %v", err)
+	}
+	if want := filepath.Join(dir, "existing_"); app.State.Root != want {
+		t.Fatalf("state root = %q, want %q", app.State.Root, want)
 	}
 }

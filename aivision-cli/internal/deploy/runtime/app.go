@@ -312,11 +312,19 @@ git fetch --prune origin && git checkout %s && git reset --hard origin/%s`,
 	if a.State == nil {
 		return nil
 	}
-	if err := pathguard.EnsureWithin(a.SourceRoot(), dir); err != nil {
-		a.Log.Warn("cloned %s outside sourceRoot; --purge-repos will keep it: %v", dir, err)
+	if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
+		a.Log.Warn("cloned %s outside sourceRoot or at its root; --purge-repos will keep it: %v", dir, err)
 		return nil
 	}
-	if err := a.State.RecordManagedRepo(dir); err != nil {
+	id, err := newRepoOwnerID()
+	if err != nil {
+		return fmt.Errorf("assign ownership to cloned repo %s: %w", dir, err)
+	}
+	if err := writeRepoOwner(dir, id); err != nil {
+		return fmt.Errorf("mark cloned repo %s: %w", dir, err)
+	}
+	if err := a.State.RecordManagedRepo(dir, id); err != nil {
+		_ = os.Remove(filepath.Join(dir, repoOwnerMarker))
 		return fmt.Errorf("record cloned repo %s: %w", dir, err)
 	}
 	return nil

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,17 +60,72 @@ func TestManagedReposRoundTrip(t *testing.T) {
 		t.Fatalf("ManagedRepos before recording = %v, %v", repos, err)
 	}
 	dir := filepath.Join(t.TempDir(), "repo")
-	if err := s.RecordManagedRepo(dir); err != nil {
+	if err := s.RecordManagedRepo(dir, "first"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordManagedRepo(dir); err != nil {
+	if err := s.RecordManagedRepo(dir, "second"); err != nil {
 		t.Fatal(err)
 	}
 	repos, err = s.ManagedRepos()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(repos) != 1 || repos[0] != dir {
-		t.Fatalf("ManagedRepos = %v, want [%s]", repos, dir)
+	if len(repos) != 1 || repos[0].Path != dir || repos[0].ID != "second" {
+		t.Fatalf("ManagedRepos = %v, want one record for %s with id second", repos, dir)
+	}
+}
+
+func TestManagedReposSurviveStatePurge(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := s.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "repo")
+	if err := s.RecordManagedRepo(dir, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != dir || repos[0].ID != "id" {
+		t.Fatalf("records after state purge = %v, %v", repos, err)
+	}
+	if err := s.ForgetManagedRepo(dir); err != nil {
+		t.Fatal(err)
+	}
+	repos, err = s.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("records after forget = %v, %v", repos, err)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, ".aivision-repos")); !os.IsNotExist(err) {
+		t.Fatalf("empty record directory still exists: %v", err)
+	}
+}
+
+func TestManagedReposReadsLegacyRecord(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := os.MkdirAll(s.StateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "repo")
+	legacy, err := json.Marshal([]string{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.legacyReposFile(), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != dir || repos[0].ID != "" {
+		t.Fatalf("legacy records = %v, %v", repos, err)
+	}
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "other"), "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.legacyReposFile()); !os.IsNotExist(err) {
+		t.Fatalf("legacy record file was not migrated: %v", err)
 	}
 }

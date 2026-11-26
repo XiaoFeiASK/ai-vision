@@ -13,6 +13,10 @@ func TestValidateNamespace(t *testing.T) {
 		"aiv.test",
 		"a1",
 		"0",
+		"existing_",
+		"Existing-Test",
+		"trailing-",
+		strings.Repeat("a", 64),
 	}
 	for _, namespace := range valid {
 		t.Run("valid/"+namespace, func(t *testing.T) {
@@ -33,11 +37,9 @@ func TestValidateNamespace(t *testing.T) {
 		"a\\b",
 		".hidden",
 		"-leading",
-		"trailing-",
+		"_leading",
 		"with space",
-		"UPPER",
 		"a$b",
-		strings.Repeat("a", 64),
 	}
 	for _, namespace := range invalid {
 		t.Run("invalid/"+namespace, func(t *testing.T) {

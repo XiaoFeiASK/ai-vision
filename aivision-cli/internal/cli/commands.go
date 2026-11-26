@@ -499,7 +499,7 @@ func cmdDestroy(args []string) error {
 	opts := runtime.DestroyOpts{Purge: *purge || *purgeRepos, PurgeRepos: *purgeRepos}
 	if !*yes {
 		warn := "This stops all AI Vision components in namespace '" + app.BP.Metadata.Namespace + "'."
-		if opts.Purge {
+		if opts.Purge && !useCompose {
 			warn += "\n  State directory to delete: " + app.State.Root
 		}
 		if useCompose && opts.Purge {
@@ -519,8 +519,8 @@ func cmdDestroy(args []string) error {
 				warn += "\n  --purge-repos: no aiv-cloned repos recorded; pre-existing checkouts will be kept."
 			} else {
 				warn += "\n  --purge-repos ALSO deletes these aiv-cloned repos:"
-				for _, dir := range repos {
-					warn += "\n    " + dir
+				for _, repo := range repos {
+					warn += "\n    " + repo.Path
 				}
 			}
 		}
