@@ -234,6 +234,9 @@ func (s *State) VerifyRecordTargets() error {
 	if s.Workdir == "" {
 		return fmt.Errorf("ownership records have no workdir")
 	}
+	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.Root); err != nil {
+		return fmt.Errorf("refusing ownership records: %w", err)
+	}
 	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.reposFile()); err != nil {
 		return fmt.Errorf("refusing ownership records: %w", err)
 	}

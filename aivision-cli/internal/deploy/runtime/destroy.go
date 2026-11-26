@@ -3,6 +3,8 @@ package runtime
 import (
 	"github.com/antgroup/ai-vision/aivision-cli/internal/deploy/components"
 
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -210,7 +212,11 @@ func (a *App) repoPurgePlan() (repoPurgePlan, error) {
 // ownership is verified the checkout is renamed here before deletion, so an
 // interrupted recursive delete can be resumed on the next invocation.
 func (a *App) purgeTombstone(repo ManagedRepo) string {
-	return filepath.Join(filepath.Dir(repo.Path), "."+filepath.Base(repo.Path)+".aiv-purge-"+repo.ID)
+	// Hash the record-supplied id so a crafted value cannot add path
+	// separators or ".." components to the tombstone path.
+	sum := sha256.Sum256([]byte(repo.ID))
+	suffix := hex.EncodeToString(sum[:8])
+	return filepath.Join(filepath.Dir(repo.Path), "."+filepath.Base(repo.Path)+".aiv-purge-"+suffix)
 }
 
 func verifyRepoOwner(dir, want string) error {

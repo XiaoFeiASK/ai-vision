@@ -152,3 +152,29 @@ func TestRecordTargetsStayInsideWorkdir(t *testing.T) {
 		t.Fatalf("pending record changed on refusal: %q, %v", data, err)
 	}
 }
+
+func TestRecordTargetsRejectRootOutsideWorkdir(t *testing.T) {
+	workdir := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := NewState(workdir, "..")
+	legacy := filepath.Join(filepath.Dir(workdir), "state", "repos.json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.VerifyRecordTargets(); err == nil {
+		t.Fatal("VerifyRecordTargets accepted a state root outside workdir")
+	}
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "repo"), "id"); err == nil {
+		t.Fatal("RecordManagedRepo accepted a state root outside workdir")
+	}
+	data, err := os.ReadFile(legacy)
+	if err != nil || string(data) != "pending" {
+		t.Fatalf("legacy record outside workdir changed: %q, %v", data, err)
+	}
+}

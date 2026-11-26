@@ -258,6 +258,9 @@ func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
 	if err := os.Rename(cloned, tombstone); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Remove(filepath.Join(tombstone, ".git", "aivision-clone.json")); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(tombstone, "partially-removed"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -279,6 +282,30 @@ func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
 	repos, err := app.State.ManagedRepos()
 	if err != nil || len(repos) != 0 {
 		t.Fatalf("record survived: %v, %v", repos, err)
+	}
+}
+
+func TestDestroyPurgeReposIgnoresMaliciousOwnerID(t *testing.T) {
+	sourceRoot := t.TempDir()
+	victim := filepath.Join(sourceRoot, "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victim, "keep"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "../../victim", "../../victim")
+
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keep")); err != nil {
+		t.Fatalf("unrelated directory was removed by a crafted owner id: %v", err)
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("checkout was not removed: %v", err)
 	}
 }
 
