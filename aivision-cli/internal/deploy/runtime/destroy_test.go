@@ -232,4 +232,99 @@ func TestDestroyPurgeReposKeepsRecordWhenRemovalFails(t *testing.T) {
 	if err != nil || len(repos) != 1 || repos[0].Path != cloned {
 		t.Fatalf("failed cleanup did not retain its record: %v, %v", repos, err)
 	}
+
+	if err := os.Chmod(sourceRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatalf("retry after restoring permissions failed: %v", err)
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("checkout survived the retry: %v", err)
+	}
+	repos, err = app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("record survived the retry: %v, %v", repos, err)
+	}
+}
+
+func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := os.Rename(cloned, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tombstone, "partially-removed"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := app.PurgeRepoPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview) != 1 || preview[0] != cloned {
+		t.Fatalf("preview = %v, want pending removal %s", preview, cloned)
+	}
+
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tombstone); !os.IsNotExist(err) {
+		t.Fatalf("pending removal survived: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("record survived: %v, %v", repos, err)
+	}
+}
+
+func TestPurgeRepoPreviewMatchesRemovalCandidates(t *testing.T) {
+	sourceRoot := t.TempDir()
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot)
+	verified := filepath.Join(sourceRoot, "verified")
+	replaced := filepath.Join(sourceRoot, "replaced")
+	makeClone(t, app, verified, "verified-id", "verified-id")
+	makeClone(t, app, replaced, "expected-id", "different-id")
+
+	preview, err := app.PurgeRepoPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview) != 1 || preview[0] != verified {
+		t.Fatalf("preview = %v, want [%s]", preview, verified)
+	}
+}
+
+func TestDestroyPurgeReposRefusesRecordPathOutsideWorkdir(t *testing.T) {
+	workdir := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := newDestroyTestApp(t, workdir, t.TempDir())
+	app.State = NewState(workdir, "../../escape")
+	teardownRan := filepath.Join(t.TempDir(), "teardown-ran")
+	app.BP.Components[0].Teardown = []Step{{Shell: "touch " + teardownRan}}
+
+	recordPath := filepath.Join(filepath.Dir(workdir), "escape.json")
+	if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(recordPath, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err == nil {
+		t.Fatal("destroy accepted ownership records outside workdir")
+	}
+	if _, err := os.Stat(teardownRan); !os.IsNotExist(err) {
+		t.Fatalf("teardown ran before record targets were validated: %v", err)
+	}
+	data, err := os.ReadFile(recordPath)
+	if err != nil || string(data) != "pending" {
+		t.Fatalf("pending record changed on refusal: %q, %v", data, err)
+	}
 }

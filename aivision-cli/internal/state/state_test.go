@@ -129,3 +129,26 @@ func TestManagedReposReadsLegacyRecord(t *testing.T) {
 		t.Fatalf("legacy record file was not migrated: %v", err)
 	}
 }
+
+func TestRecordTargetsStayInsideWorkdir(t *testing.T) {
+	workdir := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := NewState(workdir, "../../escape")
+	recordPath := filepath.Join(filepath.Dir(workdir), "escape.json")
+	if err := os.WriteFile(recordPath, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ManagedRepos(); err == nil {
+		t.Fatal("ManagedRepos accepted a record path outside workdir")
+	}
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "repo"), "id"); err == nil {
+		t.Fatal("RecordManagedRepo accepted a record path outside workdir")
+	}
+	data, err := os.ReadFile(recordPath)
+	if err != nil || string(data) != "pending" {
+		t.Fatalf("pending record changed on refusal: %q, %v", data, err)
+	}
+}

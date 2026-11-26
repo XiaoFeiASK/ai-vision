@@ -112,13 +112,30 @@ func TestDestroyConfirmationMatchesTarget(t *testing.T) {
 func TestDestroyPromptListsRecordedRepos(t *testing.T) {
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "src", "backend")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".git", "aivision-clone.json"), []byte(`{"id":"id"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := runtime.NewState(dir, "repo-prompt").RecordManagedRepo(repo, "id"); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "src", "stale")
+	if err := os.MkdirAll(filepath.Join(stale, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, ".git", "aivision-clone.json"), []byte(`{"id":"different"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.NewState(dir, "repo-prompt").RecordManagedRepo(stale, "id"); err != nil {
 		t.Fatal(err)
 	}
 	out, err := captureCLIStderr(t, "n\n", func() error {
 		return cmdDestroy([]string{
 			"--file", "../../blueprints/aivision.yaml",
 			"--workdir", dir,
+			"--source-root", filepath.Join(dir, "src"),
 			"--namespace", "repo-prompt",
 			"--purge-repos",
 		})
@@ -128,6 +145,9 @@ func TestDestroyPromptListsRecordedRepos(t *testing.T) {
 	}
 	if !strings.Contains(out, repo) {
 		t.Fatalf("recorded repo missing from confirmation: %q", out)
+	}
+	if strings.Contains(out, stale) {
+		t.Fatalf("stale record was listed for deletion: %q", out)
 	}
 }
 
@@ -177,5 +197,53 @@ components:
 	}
 	if _, err := os.Stat(filepath.Join(existing, "file")); err != nil {
 		t.Fatalf("pre-existing checkout was removed: %v", err)
+	}
+}
+
+func TestDestroyStatePreflightRefusesBeforeVolumeRemoval(t *testing.T) {
+	workdir := t.TempDir()
+	sourceRoot := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "keep"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(workdir, "aivision")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	capture := filepath.Join(t.TempDir(), "docker-args")
+	fakeDocker := filepath.Join(t.TempDir(), "docker")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AIV_DOCKER_CAPTURE\"\ncase \"$1\" in\n  container) echo \"No such container: $3\" >&2 ;;\n  volume) echo \"No such volume: $3\" >&2 ;;\nesac\nexit 1\n"
+	if err := os.WriteFile(fakeDocker, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_BIN", fakeDocker)
+	t.Setenv("AIV_DOCKER_CAPTURE", capture)
+
+	bpPath := filepath.Join(t.TempDir(), "blueprint.yaml")
+	content := fmt.Sprintf(`metadata: {name: vol-test, namespace: aivision}
+config:
+  workdir: %s
+  sourceRoot: %s
+  dockerNetwork: test
+components:
+  - {name: demo, kind: container, image: busybox, volumes: ["aivision-data:/data"]}
+`, workdir, sourceRoot)
+	if err := os.WriteFile(bpPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmdDestroy([]string{"--file", bpPath, "--workdir", workdir, "--namespace", "aivision", "--purge", "-y"}); err == nil {
+		t.Fatal("destroy accepted a state root that resolves outside workdir")
+	}
+	args, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(args), "volume rm") {
+		t.Fatalf("volume removal ran despite the state preflight failure: %q", args)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "keep")); err != nil {
+		t.Fatalf("state target outside workdir was modified: %v", err)
 	}
 }

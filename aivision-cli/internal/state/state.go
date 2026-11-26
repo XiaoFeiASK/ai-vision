@@ -227,6 +227,22 @@ func (s *State) reposFile() string {
 // purgeable state directory.
 func (s *State) legacyReposFile() string { return filepath.Join(s.StateDir, "repos.json") }
 
+// VerifyRecordTargets keeps both record locations inside their intended
+// storage: current records inside workdir, legacy records inside the state
+// root. Callers check this before writing, cleaning up or tearing down.
+func (s *State) VerifyRecordTargets() error {
+	if s.Workdir == "" {
+		return fmt.Errorf("ownership records have no workdir")
+	}
+	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.reposFile()); err != nil {
+		return fmt.Errorf("refusing ownership records: %w", err)
+	}
+	if err := pathguard.EnsureStrictlyWithin(s.Root, s.legacyReposFile()); err != nil {
+		return fmt.Errorf("refusing legacy ownership records: %w", err)
+	}
+	return nil
+}
+
 func readManagedRepos(path string) ([]ManagedRepo, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -254,8 +270,8 @@ func readManagedRepos(path string) ([]ManagedRepo, error) {
 // current location with the legacy in-state file so a pre-upgrade record is
 // not lost while it still exists.
 func (s *State) ManagedRepos() ([]ManagedRepo, error) {
-	if s.Workdir == "" {
-		return nil, fmt.Errorf("state root has no workdir")
+	if err := s.VerifyRecordTargets(); err != nil {
+		return nil, err
 	}
 	var out []ManagedRepo
 	seen := map[string]bool{}
@@ -281,6 +297,9 @@ func (s *State) ManagedRepos() ([]ManagedRepo, error) {
 }
 
 func (s *State) writeManagedRepos(repos []ManagedRepo) error {
+	if err := s.VerifyRecordTargets(); err != nil {
+		return err
+	}
 	path := s.reposFile()
 	if len(repos) == 0 {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
