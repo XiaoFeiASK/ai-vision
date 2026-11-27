@@ -397,6 +397,39 @@ func TestDestroyPurgeReposPreservesUnmarkedPendingTombstone(t *testing.T) {
 	}
 }
 
+func TestDestroyPurgeReposKeepsTombstoneWhenRenameNeverHappened(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	repo := ManagedRepo{Path: cloned, ID: "owner-id"}
+	tombstone := app.purgeTombstone(repo)
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	// Crash window: the marker is durable but the rename has not run yet.
+	if err := writePurgeMarker(tombstone, repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tombstone, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cloned, "file")); err != nil {
+		t.Fatalf("original checkout was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tombstone, "keep")); err != nil {
+		t.Fatalf("unrelated directory at the tombstone path was removed: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 1 || !repos[0].Pending {
+		t.Fatalf("pending record = %v, %v", repos, err)
+	}
+}
+
 func TestDestroyPurgeReposUsesConfirmedCandidates(t *testing.T) {
 	sourceRoot := t.TempDir()
 	first := filepath.Join(sourceRoot, "first")

@@ -274,7 +274,7 @@ func (a *App) repoPurgePlan() (repoPurgePlan, error) {
 
 func (a *App) addPendingCandidate(plan *repoPurgePlan, repo ManagedRepo, tombstone string) error {
 	if _, err := os.Lstat(tombstone); err == nil {
-		if !purgeMarkerMatches(tombstone, repo) {
+		if !purgeMarkerOwnsTombstone(tombstone, repo) {
 			plan.kept = append(plan.kept, repo.Path+" (pending removal path is not owned by this record)")
 			return nil
 		}
@@ -308,8 +308,22 @@ func (a *App) purgeTombstone(repo ManagedRepo) string {
 
 func purgeMarkerPath(tombstone string) string { return tombstone + ".owner" }
 
+type purgeMarkerRecord struct {
+	Path        string `json:"path"`
+	ID          string `json:"id"`
+	HasIdentity bool   `json:"hasIdentity,omitempty"`
+	Dev         uint64 `json:"dev,omitempty"`
+	Ino         uint64 `json:"ino,omitempty"`
+}
+
 func writePurgeMarker(tombstone string, repo ManagedRepo) error {
-	b, err := json.Marshal(ManagedRepo{Path: repo.Path, ID: repo.ID, Pending: true})
+	marker := purgeMarkerRecord{Path: repo.Path, ID: repo.ID}
+	if dev, ino, ok := fileIdentity(repo.Path); ok {
+		marker.HasIdentity = true
+		marker.Dev = dev
+		marker.Ino = ino
+	}
+	b, err := json.Marshal(marker)
 	if err != nil {
 		return err
 	}
@@ -338,16 +352,40 @@ func writePurgeMarker(tombstone string, repo ManagedRepo) error {
 	return os.Rename(tmp, path)
 }
 
-func purgeMarkerMatches(tombstone string, repo ManagedRepo) bool {
+func readPurgeMarker(tombstone string) (purgeMarkerRecord, error) {
 	b, err := os.ReadFile(purgeMarkerPath(tombstone))
 	if err != nil {
-		return false
+		return purgeMarkerRecord{}, err
 	}
-	var marker ManagedRepo
+	var marker purgeMarkerRecord
 	if err := json.Unmarshal(b, &marker); err != nil {
+		return purgeMarkerRecord{}, err
+	}
+	return marker, nil
+}
+
+func purgeMarkerMatches(tombstone string, repo ManagedRepo) bool {
+	marker, err := readPurgeMarker(tombstone)
+	return err == nil && marker.Path == repo.Path && marker.ID == repo.ID
+}
+
+// purgeMarkerOwnsTombstone verifies that the directory at the tombstone path
+// is the object that was renamed, not merely that a removal was once planned.
+func purgeMarkerOwnsTombstone(tombstone string, repo ManagedRepo) bool {
+	marker, err := readPurgeMarker(tombstone)
+	if err != nil || marker.Path != repo.Path || marker.ID != repo.ID {
 		return false
 	}
-	return marker.Path == repo.Path && marker.ID == repo.ID
+	if marker.HasIdentity {
+		dev, ino, ok := fileIdentity(tombstone)
+		return ok && dev == marker.Dev && ino == marker.Ino
+	}
+	// Without a persisted identity, only trust the tombstone when the checkout
+	// is no longer at its original path, so the rename must have happened.
+	if _, err := os.Lstat(repo.Path); err == nil || !os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 // beginPendingRemoval records the intent and ownership of a tombstone before
@@ -451,8 +489,8 @@ func (a *App) removeManagedRepos(repos []ManagedRepo) error {
 func (a *App) finishPendingRemoval(repo ManagedRepo, tombstone string) error {
 	dir := repo.Path
 	if _, err := os.Lstat(tombstone); err == nil {
-		if !purgeMarkerMatches(tombstone, repo) {
-			a.Log.Warn("keeping repo %s: pending removal %s has no matching ownership marker", dir, tombstone)
+		if !purgeMarkerOwnsTombstone(tombstone, repo) {
+			a.Log.Warn("keeping repo %s: pending removal %s is not the renamed checkout", dir, tombstone)
 			return nil
 		}
 		a.Log.Info("finishing interrupted removal %s", dir)
