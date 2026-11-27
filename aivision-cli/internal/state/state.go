@@ -250,6 +250,10 @@ func namespaceKey(namespace string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// maxRecordBasename is the common NAME_MAX used to decide whether a
+// namespace-derived legacy record name can exist on the filesystem.
+const maxRecordBasename = 255
+
 // legacyReposFile is the record location used before records moved out of the
 // purgeable state directory.
 func (s *State) legacyReposFile() string { return filepath.Join(s.StateDir, "repos.json") }
@@ -559,8 +563,10 @@ func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 		{s.reposFile(), store.readFile},
 		{s.legacyReposFile(), store.readWorkFile},
 	}
-	if _, err := store.rel(named); err == nil {
-		sources = append(sources, repoSource{named, store.readFile})
+	if len(filepath.Base(named)) <= maxRecordBasename {
+		if _, err := store.rel(named); err == nil {
+			sources = append(sources, repoSource{named, store.readFile})
+		}
 	}
 	for _, source := range sources {
 		b, exists, err := source.read(source.path)
@@ -601,6 +607,9 @@ func (s *State) writeManagedReposLocked(store *recordStore, repos []ManagedRepo)
 
 func (s *State) removeNamedRepos(store *recordStore) {
 	path := s.namedReposFile()
+	if len(filepath.Base(path)) > maxRecordBasename {
+		return
+	}
 	if _, err := store.rel(path); err == nil {
 		_ = store.remove(path)
 	}
@@ -637,15 +646,14 @@ func (s *State) withRecordLock(fn func(*recordStore) error) error {
 	if err != nil {
 		return err
 	}
-	dirRel, relErr := store.workRel(store.base)
+	// The record directory is retained on purpose: a process waiting for this
+	// lock may already hold an os.Root handle on it, and removing the directory
+	// would make that process write into an unlinked directory.
 	defer func() {
 		release()
 		if store.root != nil {
 			_ = store.root.Close()
 			store.root = nil
-		}
-		if relErr == nil {
-			_ = store.work.Remove(dirRel)
 		}
 	}()
 	if err := s.VerifyRecordTargets(); err != nil {

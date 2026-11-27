@@ -392,6 +392,9 @@ func TestDestroyPurgeReposRetiresCompletedPendingForReplacement(t *testing.T) {
 	if err := app.State.SetRepoPending(cloned, "old-id", true); err != nil {
 		t.Fatal(err)
 	}
+	repo := ManagedRepo{Path: cloned, ID: "old-id"}
+	tombstone := app.purgeTombstone(repo)
+	writeTestPurgeMarker(t, sourceRoot, tombstone, repo)
 	// The old checkout is gone and no tombstone remains: deletion completed.
 	if err := os.RemoveAll(cloned); err != nil {
 		t.Fatal(err)
@@ -410,6 +413,9 @@ func TestDestroyPurgeReposRetiresCompletedPendingForReplacement(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0].ID != "new-id" || repos[0].Pending {
 		t.Fatalf("records after retiring the completed removal = %v", repos)
+	}
+	if _, err := os.Stat(purgeMarkerPath(tombstone)); !os.IsNotExist(err) {
+		t.Fatalf("pending-removal marker survived retirement: %v", err)
 	}
 }
 

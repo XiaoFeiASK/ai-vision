@@ -501,10 +501,7 @@ func (a *App) retirePendingRepo(fs *repoFS, repo ManagedRepo) error {
 		return nil
 	}
 	a.Log.Info("retiring completed pending removal %s", current.Path)
-	if err := a.State.ForgetManagedRepoID(current.Path, current.ID); err != nil {
-		return fmt.Errorf("retire pending removal %s: %w", current.Path, err)
-	}
-	return nil
+	return a.retirePendingRemoval(fs, current, tombstone)
 }
 
 // removeManagedRepos deletes only checkouts aiv cloned. Pre-existing local
@@ -622,10 +619,7 @@ func (a *App) finishPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone strin
 		}
 		if owner != repoOwnerMatches {
 			a.Log.Info("retiring completed pending removal %s", dir)
-			if err := a.State.ForgetManagedRepoID(dir, repo.ID); err != nil {
-				return fmt.Errorf("retire pending removal %s: %w", dir, err)
-			}
-			return nil
+			return a.retirePendingRemoval(fs, repo, tombstone)
 		}
 		a.Log.Info("resuming removal of %s", dir)
 		if err := a.beginPendingRemoval(fs, repo, tombstone, true); err != nil {
@@ -638,6 +632,14 @@ func (a *App) finishPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone strin
 	_ = fs.remove(purgeMarkerPath(tombstone))
 	if err := a.State.ForgetManagedRepoID(dir, repo.ID); err != nil {
 		return fmt.Errorf("forget removed repo %s: %w", dir, err)
+	}
+	return nil
+}
+
+func (a *App) retirePendingRemoval(fs *repoFS, repo ManagedRepo, tombstone string) error {
+	_ = fs.remove(purgeMarkerPath(tombstone))
+	if err := a.State.ForgetManagedRepoID(repo.Path, repo.ID); err != nil {
+		return fmt.Errorf("retire pending removal %s: %w", repo.Path, err)
 	}
 	return nil
 }

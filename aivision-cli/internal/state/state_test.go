@@ -206,6 +206,51 @@ func TestLongNamespaceUsesBoundedRecordAndLockNames(t *testing.T) {
 	}
 }
 
+func TestNamespaceLengthsAroundLegacyRecordLimit(t *testing.T) {
+	for _, length := range []int{240, 250, 251, 254} {
+		t.Run(strconv.Itoa(length), func(t *testing.T) {
+			s := NewState(t.TempDir(), strings.Repeat("a", length))
+			repo := filepath.Join(t.TempDir(), "repo")
+			if err := s.RecordManagedRepo(repo, "id"); err != nil {
+				t.Fatal(err)
+			}
+			repos, err := s.ManagedRepos()
+			if err != nil || len(repos) != 1 || repos[0].Path != repo {
+				t.Fatalf("records with a %d-character namespace = %v, %v", length, repos, err)
+			}
+		})
+	}
+
+	s := NewState(t.TempDir(), strings.Repeat("a", 300))
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "repo"), "id"); err == nil {
+		t.Fatal("RecordManagedRepo accepted a namespace that cannot be a directory name")
+	}
+}
+
+func TestRecordStoreStaysWritableAfterConcurrentCleanup(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	store, err := s.openRecordStore(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := s.RecordManagedRepo(repo, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ForgetManagedRepo(repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeFileAtomic(s.reposFile(), []byte("[]"), 0o644); err != nil {
+		t.Fatalf("record store opened before cleanup became unusable: %v", err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("records after concurrent write = %v, %v", repos, err)
+	}
+}
+
 func TestRemoveAllDoesNotDependOnRecordStorage(t *testing.T) {
 	workdir := t.TempDir()
 	s := NewState(workdir, "aivision")
@@ -251,8 +296,12 @@ func TestManagedReposSurviveStatePurge(t *testing.T) {
 	if err != nil || len(repos) != 0 {
 		t.Fatalf("records after forget = %v, %v", repos, err)
 	}
-	if _, err := os.Stat(filepath.Join(workdir, ".aivision-repos")); !os.IsNotExist(err) {
-		t.Fatalf("empty record directory still exists: %v", err)
+	entries, err := os.ReadDir(s.recordDir())
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("records remain after forget: %v", entries)
 	}
 }
 
