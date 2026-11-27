@@ -188,6 +188,10 @@ func TestDestroyPurgeReposSkipsUnusableRecordsAndCleansOthers(t *testing.T) {
 
 	outside := filepath.Join(t.TempDir(), "outside")
 	makeClone(t, app, outside, "outside-id", "outside-id")
+	// A component of a stale external record is now a regular file.
+	if err := app.State.RecordManagedRepo(filepath.Join(outside, "file", "old"), "stale-id"); err != nil {
+		t.Fatal(err)
+	}
 	makeClone(t, app, sourceRoot, "root-id", "root-id")
 	valid := filepath.Join(sourceRoot, "valid")
 	makeClone(t, app, valid, "valid-id", "valid-id")

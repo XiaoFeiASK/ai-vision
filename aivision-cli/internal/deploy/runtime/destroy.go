@@ -260,6 +260,9 @@ func (a *App) repoPurgePlan(fs *repoFS, confirmed []ManagedRepo) (repoPurgePlan,
 		return plan, fmt.Errorf("read recorded repos: %w", err)
 	}
 	pending := make(map[string]ManagedRepo)
+	for _, repo := range confirmed {
+		fs.plannedCheckoutPaths = append(fs.plannedCheckoutPaths, repo.Path)
+	}
 	for _, repo := range repos {
 		if repo.Pending {
 			pending[repo.Path] = repo
@@ -270,6 +273,7 @@ func (a *App) repoPurgePlan(fs *repoFS, confirmed []ManagedRepo) (repoPurgePlan,
 			plan.kept = append(plan.kept, repo.Path+" ("+err.Error()+")")
 			continue
 		}
+		fs.plannedCheckoutPaths = append(fs.plannedCheckoutPaths, repo.Path)
 		if repo.ID == "" {
 			plan.kept = append(plan.kept, repo.Path+" (no verified ownership id)")
 			continue
@@ -524,6 +528,24 @@ func (a *App) cleanupMissingRepo(fs *repoFS, repo ManagedRepo) error {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect orphan %s: %w", current.Path, err)
+	}
+	// A pending parent may have moved this checkout with it. Keep its record
+	// so the next invocation can still protect the child in the renamed tree.
+	records, err := a.State.ManagedRepos()
+	if err != nil {
+		return err
+	}
+	for _, parent := range records {
+		if !parent.Pending {
+			continue
+		}
+		rel, err := nestedCheckoutRel(parent.Path, a.purgeTombstone(parent), current.Path)
+		if err != nil {
+			return err
+		}
+		if rel != "" {
+			return nil
+		}
 	}
 	if _, err := a.State.ForgetManagedRepoIDIfActive(current.Path, current.ID); err != nil {
 		return fmt.Errorf("forget removed repo %s: %w", current.Path, err)

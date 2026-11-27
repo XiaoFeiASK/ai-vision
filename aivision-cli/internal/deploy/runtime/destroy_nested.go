@@ -2,22 +2,45 @@ package runtime
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
-// nestedCheckout inspects only the checkout roots declared in the blueprint.
 // tree is the current location of the outer checkout, including after a rename.
 // An eligible inner clone may be shown in the same preview as its parent.
 func (a *App) nestedCheckout(fs *repoFS, outer, tree string, eligible map[string]bool, records []ManagedRepo) (string, error) {
+	// A component can disappear from the blueprint while its record survives.
+	// Remember both sources, including current pending removals whose checkout
+	// has already moved out of the way.
+	paths := make(map[string]bool)
 	for _, component := range a.BP.Components {
-		child := a.RepoDir(component)
-		if child == "" {
-			continue
+		if child := a.RepoDir(component); child != "" {
+			paths[child] = false
 		}
+	}
+	for _, path := range fs.plannedCheckoutPaths {
+		paths[path] = false
+	}
+	for _, record := range records {
+		if _, known := paths[record.Path]; !known {
+			// A stale record outside the source root must not block unrelated
+			// removals. Always inspect lexical children of the parent itself.
+			rel, err := filepath.Rel(outer, record.Path)
+			if err != nil {
+				return "", err
+			}
+			if !filepath.IsLocal(rel) && pathguard.EnsureStrictlyWithin(fs.base, record.Path) != nil {
+				continue
+			}
+		}
+		paths[record.Path] = paths[record.Path] || record.Pending
+	}
+	for _, child := range slices.Sorted(maps.Keys(paths)) {
 		rel, err := nestedCheckoutRel(outer, tree, child)
 		if err != nil {
 			return "", err
@@ -32,16 +55,8 @@ func (a *App) nestedCheckout(fs *repoFS, outer, tree string, eligible map[string
 		}
 		// A nested removal may already have moved the checkout to its sibling
 		// tombstone. Let that operation finish before removing the parent.
-		if records == nil {
-			records, err = a.State.ManagedRepos()
-			if err != nil {
-				return "", err
-			}
-		}
-		for _, record := range records {
-			if record.Pending && record.Path == child {
-				return child, nil
-			}
+		if paths[child] {
+			return child, nil
 		}
 	}
 	return "", nil
@@ -81,7 +96,11 @@ func nestedCheckoutRel(parent, tree, child string) (string, error) {
 }
 
 func (a *App) verifyNestedCheckouts(fs *repoFS, parent, tree string) error {
-	child, err := a.nestedCheckout(fs, parent, tree, nil, nil)
+	records, err := a.State.ManagedRepos()
+	if err != nil {
+		return err
+	}
+	child, err := a.nestedCheckout(fs, parent, tree, nil, records)
 	if err != nil {
 		return err
 	}

@@ -681,10 +681,10 @@ namespace state directory (`<workdir>/<namespace>`). Keep the workdir outside
 checkouts you intend to purge. `destroy --purge-repos` also purges state.
 Its prompt lists the verified clones. Removing a clone also removes its
 uncommitted changes and untracked files. At each checkout path declared in the
-blueprint, the CLI keeps reused worktrees, copies and clones without a
-verifiable ownership record. It also keeps an outer checkout that contains one
-of those declared checkouts. Checkout cleanup requires hard-link support on
-the checkout filesystem.
+blueprint or recorded for the deployment, the CLI keeps reused worktrees, copies
+and clones without verifiable ownership. It also keeps an outer checkout that
+contains one of those protected checkouts, even after the blueprint changes.
+Checkout cleanup requires hard-link support on the checkout filesystem.
 If cleanup is interrupted, rerun the same command with the original selectors.
 
 ### Query (see [`docs/query.md`](docs/query.md))

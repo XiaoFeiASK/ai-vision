@@ -22,6 +22,9 @@ var errSourceRootMissing = errors.New("source root does not exist")
 type repoFS struct {
 	root *os.Root
 	base string
+	// Keep planned checkout paths until this purge finishes. Removing an inner
+	// record must not let a replacement at the same path disappear with its parent.
+	plannedCheckoutPaths []string
 }
 
 func openRepoFS(base string) (*repoFS, error) {

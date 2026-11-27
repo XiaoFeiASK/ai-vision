@@ -112,6 +112,32 @@ func TestDestroyConfirmationMatchesTarget(t *testing.T) {
 	}
 }
 
+func TestDestroyExternalDatabaseWarnsAboutDockerNamedVolumes(t *testing.T) {
+	dir := t.TempDir()
+	bp := filepath.Join(dir, "blueprint.yaml")
+	config := fmt.Sprintf(`metadata: {name: archive, namespace: demo}
+config: {workdir: %q, sourceRoot: %q, vars: {OB_MANAGED: "false", OB_HOST: "db.example"}}
+components:
+  - name: archive
+    kind: container
+    image: fixture
+    mounts: ["type=volume,source=archive,target=/archive"]
+`, filepath.Join(dir, "work"), filepath.Join(dir, "src"))
+	if err := os.WriteFile(bp, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIStderr(t, "n\n", func() error {
+		return cmdDestroy([]string{"--file", bp, "--purge"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	warning, _, prompted := strings.Cut(out, "Continue?")
+	if !prompted || !strings.Contains(warning, "named volumes") || !strings.Contains(warning, "external OceanBase at db.example") {
+		t.Fatalf("expected the Docker volume warning and external database scope before confirmation: %q", out)
+	}
+}
+
 func TestDestroyPromptListsRecordedRepos(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")

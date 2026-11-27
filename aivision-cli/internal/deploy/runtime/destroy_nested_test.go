@@ -78,6 +78,89 @@ func TestDestroyPurgeReposHonorsDeclaredNestedCheckouts(t *testing.T) {
 	}
 }
 
+func TestDestroyKeepsRecordedNestedCheckoutAfterBlueprintChange(t *testing.T) {
+	src := t.TempDir()
+	outer := filepath.Join(src, "outer")
+	inner := filepath.Join(outer, "inner")
+	app := newDestroyTestApp(t, t.TempDir(), src, Repo{Path: "outer"}, Repo{Path: "outer/inner"})
+	makeClone(t, app, outer, "outer-id", "outer-id")
+	makeClone(t, app, inner, "inner-id", "inner-id")
+	app.BP.Components = app.BP.Components[:len(app.BP.Components)-1]
+
+	plan, err := app.PurgeRepoPlan()
+	if err != nil || len(plan) != 2 || plan[0].Path != inner || plan[1].Path != outer {
+		t.Fatalf("expected both owned checkouts, child first: %v, %v", plan, err)
+	}
+	// A user checkout now occupies the path formerly managed by the removed component.
+	if err := os.Rename(inner, filepath.Join(src, "saved-inner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(inner, ".git")
+	if err := os.WriteFile(worktree, []byte("gitdir: elsewhere\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := app.PurgeRepoPlan()
+	if err != nil || len(preview) != 0 {
+		t.Fatalf("preview includes a parent containing a replacement checkout: %v, %v", preview, err)
+	}
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true, ConfirmedRepos: plan}); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(worktree); err != nil || string(data) != "gitdir: elsewhere\n" {
+		t.Fatalf("replacement checkout changed: %q, %v", data, err)
+	}
+
+	// Resume an earlier interrupted parent removal using the revised blueprint.
+	// The inner checkout and its record must survive successive unattended retries.
+	parent := ManagedRepo{Path: outer, ID: "outer-id"}
+	tomb := app.purgeTombstone(parent)
+	if err := app.State.SetRepoPending(outer, parent.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPurgeMarker(t, src, tomb, parent)
+	if err := os.Rename(outer, tomb); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+			t.Fatal(err)
+		}
+		if records, err := app.State.ManagedRepos(); err != nil || len(records) != 2 {
+			t.Fatalf("interrupted cleanup lost a checkout record: %v, %v", records, err)
+		}
+		if data, err := os.ReadFile(filepath.Join(tomb, "inner", ".git")); err != nil || string(data) != "gitdir: elsewhere\n" {
+			t.Fatalf("replacement checkout in moved tree changed: %q, %v", data, err)
+		}
+	}
+}
+
+func TestDestroyRechecksNestedRegistrationsBeforeRemoval(t *testing.T) {
+	src := t.TempDir()
+	outer := filepath.Join(src, "outer")
+	app := newDestroyTestApp(t, t.TempDir(), src, Repo{Path: "outer"})
+	makeClone(t, app, outer, "outer-id", "outer-id")
+	fs, err := openRepoFS(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	plan, err := app.repoPurgePlan(fs, nil)
+	if err != nil || len(plan.candidates) != 1 {
+		t.Fatalf("expected one planned removal: %v, %v", plan, err)
+	}
+	inner := filepath.Join(outer, "later")
+	makeClone(t, app, inner, "child-id", "child-id")
+	if err := app.removeManagedRepos(fs, plan.candidates); err == nil {
+		t.Fatal("expected the late child registration to stop removal of the parent")
+	}
+	if data, err := os.ReadFile(filepath.Join(inner, "file")); err != nil || string(data) != "cloned" {
+		t.Fatalf("unconfirmed child changed: %q, %v", data, err)
+	}
+}
+
 func TestDestroyPurgeReposResumesNestedClonesIndependently(t *testing.T) {
 	for _, pending := range []string{"inner", "outer"} {
 		t.Run(pending, func(t *testing.T) {
