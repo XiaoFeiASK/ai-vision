@@ -285,6 +285,7 @@ func (a *App) gitCloneOrFetch(c Component) error {
 		return nil
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		a.recoverRepoRecord(dir)
 		if !a.Force {
 			a.Log.Info("reuse existing repo %s (use --force to fetch %s)", dir, branch)
 			return nil
@@ -324,10 +325,27 @@ git fetch --prune origin && git checkout %s && git reset --hard origin/%s`,
 		return fmt.Errorf("mark cloned repo %s: %w", dir, err)
 	}
 	if err := a.State.RecordManagedRepo(dir, id); err != nil {
-		_ = os.Remove(filepath.Join(dir, repoOwnerMarker))
-		return fmt.Errorf("record cloned repo %s: %w", dir, err)
+		return fmt.Errorf("record cloned repo %s: %w (checkout kept; rerun forge to retry registration or remove it manually)", dir, err)
 	}
 	return nil
+}
+
+// recoverRepoRecord repairs a clone whose record write failed after the
+// ownership marker was written. Checkouts without aiv's marker are ignored.
+func (a *App) recoverRepoRecord(dir string) {
+	if a.State == nil || a.SourceRoot() == "" {
+		return
+	}
+	id, err := repoOwnerID(dir)
+	if err != nil {
+		return
+	}
+	if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
+		return
+	}
+	if err := a.State.RecordManagedRepo(dir, id); err != nil {
+		a.Log.Warn("recover ownership record for %s: %v", dir, err)
+	}
 }
 
 // ResolveEnv builds a component's effective environment: values loaded from

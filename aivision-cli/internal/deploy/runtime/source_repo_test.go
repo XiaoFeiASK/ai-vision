@@ -128,3 +128,34 @@ func TestCloneAtSourceRootIsNotRecorded(t *testing.T) {
 		t.Fatalf("clone at sourceRoot was recorded: %v", repos)
 	}
 }
+
+func TestReusedCheckoutRecoversMissingRecord(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "src")
+	checkout := filepath.Join(sourceRoot, "backend")
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRepoOwner(checkout, "recovered-id"); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{
+		Log:   NewLogger(false),
+		Ctx:   context.Background(),
+		State: NewState(filepath.Join(root, "work"), "aivision"),
+		Vars:  map[string]string{"SOURCE_ROOT": sourceRoot},
+	}
+	component := Component{Name: "backend", Repo: &blueprint.Repo{
+		URL: "https://example.invalid/repo.git", Branch: "main", Path: "backend",
+	}}
+	if err := app.gitCloneOrFetch(component); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0].Path != checkout || repos[0].ID != "recovered-id" {
+		t.Fatalf("recovered records = %v", repos)
+	}
+}

@@ -511,7 +511,7 @@ func cmdDestroy(args []string) error {
 			warn += "\n  --purge ALSO deletes local state. The external OceanBase at " + app.Vars["OB_HOST"] + " is NOT touched."
 		}
 		if opts.PurgeRepos {
-			repos, err := app.PurgeRepoPreview()
+			repos, err := app.PurgeRepoPlan()
 			if err != nil {
 				return err
 			}
@@ -519,10 +519,11 @@ func cmdDestroy(args []string) error {
 				warn += "\n  --purge-repos: no verified aiv-cloned checkouts to delete; other records and checkouts will be kept."
 			} else {
 				warn += "\n  --purge-repos ALSO deletes these aiv-cloned repos:"
-				for _, dir := range repos {
-					warn += "\n    " + dir
+				for _, repo := range repos {
+					warn += "\n    " + repo.Path
 				}
 			}
+			opts.ConfirmedRepos = repos
 		}
 		fmt.Fprintln(os.Stderr, warn)
 		fmt.Fprint(os.Stderr, "Continue? [y/N] ")

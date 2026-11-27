@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -72,6 +74,74 @@ func TestManagedReposRoundTrip(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0].Path != dir || repos[0].ID != "second" {
 		t.Fatalf("ManagedRepos = %v, want one record for %s with id second", repos, dir)
+	}
+}
+
+func TestRecordManagedRepoPreservesPendingRemoval(t *testing.T) {
+	s := NewState(t.TempDir(), "aivision")
+	dir := filepath.Join(t.TempDir(), "repo")
+	if err := s.RecordManagedRepo(dir, "old-id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRepoPending(dir, "old-id", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordManagedRepo(dir, "new-id"); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 2 {
+		t.Fatalf("records = %v, want pending old-id and active new-id", repos)
+	}
+	seen := map[string]ManagedRepo{}
+	for _, repo := range repos {
+		seen[repo.ID] = repo
+	}
+	if !seen["old-id"].Pending {
+		t.Fatalf("pending record was overwritten: %v", repos)
+	}
+	if seen["new-id"].Pending {
+		t.Fatalf("replacement recorded as pending: %v", repos)
+	}
+
+	if err := s.ForgetManagedRepoID(dir, "old-id"); err != nil {
+		t.Fatal(err)
+	}
+	repos, err = s.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].ID != "new-id" {
+		t.Fatalf("forget by id removed the wrong record: %v, %v", repos, err)
+	}
+}
+
+func TestConcurrentRecordManagedRepoKeepsEveryRecord(t *testing.T) {
+	s := NewState(t.TempDir(), "aivision")
+	const count = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, count)
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			dir := filepath.Join(t.TempDir(), "repo")
+			if err := s.RecordManagedRepo(dir, strconv.Itoa(i)); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != count {
+		t.Fatalf("records = %d, want %d: %v", len(repos), count, repos)
 	}
 }
 
@@ -176,5 +246,28 @@ func TestRecordTargetsRejectRootOutsideWorkdir(t *testing.T) {
 	data, err := os.ReadFile(legacy)
 	if err != nil || string(data) != "pending" {
 		t.Fatalf("legacy record outside workdir changed: %q, %v", data, err)
+	}
+}
+
+func TestRecordTargetsRejectSymlinkedStorageWithoutWriting(t *testing.T) {
+	workdir := t.TempDir()
+	outside := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := os.Symlink(outside, filepath.Join(workdir, ".aivision-repos")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.ManagedRepos(); err == nil {
+		t.Fatal("ManagedRepos followed a record directory outside workdir")
+	}
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "repo"), "id"); err == nil {
+		t.Fatal("RecordManagedRepo wrote through a symlinked record directory")
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("out-of-scope directory was modified: %v", entries)
 	}
 }

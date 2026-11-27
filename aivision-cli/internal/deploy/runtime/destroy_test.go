@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -255,6 +256,12 @@ func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
 	makeClone(t, app, cloned, "owner-id", "owner-id")
 
 	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePurgeMarker(tombstone, ManagedRepo{Path: cloned, ID: "owner-id"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(cloned, tombstone); err != nil {
 		t.Fatal(err)
 	}
@@ -306,6 +313,150 @@ func TestDestroyPurgeReposIgnoresMaliciousOwnerID(t *testing.T) {
 	}
 	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
 		t.Fatalf("checkout was not removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposPreservesUnrelatedTombstone(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := os.RemoveAll(cloned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tombstone, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(tombstone, "keep")); err != nil {
+		t.Fatalf("unrelated directory at the tombstone path was removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposPreservesReplacementCheckout(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "old-id", "old-id")
+
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "old-id"})
+	if err := app.State.SetRepoPending(cloned, "old-id", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePurgeMarker(tombstone, ManagedRepo{Path: cloned, ID: "old-id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(cloned, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	makeClone(t, app, cloned, "new-id", "new-id")
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cloned, "file")); err != nil {
+		t.Fatalf("replacement checkout was removed: %v", err)
+	}
+	if _, err := os.Stat(tombstone); !os.IsNotExist(err) {
+		t.Fatalf("pending removal survived: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0].ID != "new-id" || repos[0].Pending {
+		t.Fatalf("replacement record = %v", repos)
+	}
+}
+
+func TestDestroyPurgeReposPreservesUnmarkedPendingTombstone(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(cloned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tombstone, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(tombstone, "keep")); err != nil {
+		t.Fatalf("unmarked pending-removal directory was removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposUsesConfirmedCandidates(t *testing.T) {
+	sourceRoot := t.TempDir()
+	first := filepath.Join(sourceRoot, "first")
+	second := filepath.Join(sourceRoot, "second")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "first"}, Repo{Path: "second"})
+	makeClone(t, app, first, "first-id", "first-id")
+	makeClone(t, app, second, "second-id", "second-id")
+
+	planned, err := app.PurgeRepoPlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed := make([]ManagedRepo, 0, len(planned))
+	for _, repo := range planned {
+		if repo.Path == first {
+			confirmed = append(confirmed, repo)
+		}
+	}
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true, ConfirmedRepos: confirmed}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(first); !os.IsNotExist(err) {
+		t.Fatalf("confirmed checkout survived: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(second, "file")); err != nil {
+		t.Fatalf("unconfirmed checkout was removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposSkipsDisabledComponentPath(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "../outside"}, Repo{Path: "cloned"})
+	app.BP.Components[1].Enabled = "false"
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("eligible checkout survived: %v", err)
+	}
+}
+
+func TestPurgeTombstoneNameIsBounded(t *testing.T) {
+	sourceRoot := t.TempDir()
+	longName := strings.Repeat("a", 240)
+	cloned := filepath.Join(sourceRoot, longName)
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: longName})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if name := filepath.Base(tombstone); len(name) > 64 {
+		t.Fatalf("tombstone name is too long: %d bytes", len(name))
+	}
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("long-named checkout survived: %v", err)
 	}
 }
 

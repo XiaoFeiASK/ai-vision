@@ -215,6 +215,9 @@ func (s *State) RemoveAll() error {
 type ManagedRepo struct {
 	Path string `json:"path"`
 	ID   string `json:"id,omitempty"`
+	// Pending marks a removal that was started but not completed. The record
+	// stays until the tombstone is gone, so a retry can finish the cleanup.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // reposFile lives outside the namespace root so a state-only --purge keeps
@@ -273,12 +276,17 @@ func readManagedRepos(path string) ([]ManagedRepo, error) {
 // current location with the legacy in-state file so a pre-upgrade record is
 // not lost while it still exists.
 func (s *State) ManagedRepos() ([]ManagedRepo, error) {
-	if err := s.VerifyRecordTargets(); err != nil {
-		return nil, err
-	}
+	return s.managedReposUnlocked()
+}
+
+func (s *State) managedReposUnlocked() ([]ManagedRepo, error) {
 	var out []ManagedRepo
 	seen := map[string]bool{}
+	seenPath := map[string]bool{}
 	for _, path := range []string{s.reposFile(), s.legacyReposFile()} {
+		if err := s.VerifyRecordTargets(); err != nil {
+			return nil, err
+		}
 		records, err := readManagedRepos(path)
 		if err != nil {
 			return nil, err
@@ -289,17 +297,25 @@ func (s *State) ManagedRepos() ([]ManagedRepo, error) {
 				return nil, err
 			}
 			record.Path = filepath.Clean(dir)
-			if seen[record.Path] {
+			key := record.Path + "\x00" + record.ID
+			if record.Pending {
+				key += "\x00pending"
+			}
+			if seen[key] {
 				continue
 			}
-			seen[record.Path] = true
+			if record.ID == "" && seenPath[record.Path] {
+				continue
+			}
+			seen[key] = true
+			seenPath[record.Path] = true
 			out = append(out, record)
 		}
 	}
 	return out, nil
 }
 
-func (s *State) writeManagedRepos(repos []ManagedRepo) error {
+func (s *State) writeManagedReposLocked(repos []ManagedRepo) error {
 	if err := s.VerifyRecordTargets(); err != nil {
 		return err
 	}
@@ -308,7 +324,9 @@ func (s *State) writeManagedRepos(repos []ManagedRepo) error {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		_ = os.Remove(filepath.Dir(path))
+		if err := s.VerifyRecordTargets(); err != nil {
+			return err
+		}
 		_ = os.Remove(s.legacyReposFile())
 		return nil
 	}
@@ -319,11 +337,119 @@ func (s *State) writeManagedRepos(repos []ManagedRepo) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, b, 0o644); err != nil {
+	if err := s.VerifyRecordTargets(); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(path, b, 0o644); err != nil {
+		return err
+	}
+	if err := s.VerifyRecordTargets(); err != nil {
 		return err
 	}
 	_ = os.Remove(s.legacyReposFile())
 	return nil
+}
+
+// withRecordLock serialises ownership-record updates across CLI processes.
+// The lock and the record file both live under workdir, outside the state
+// directory removed by --purge.
+func (s *State) withRecordLock(fn func() error) error {
+	if err := s.VerifyRecordTargets(); err != nil {
+		return err
+	}
+	dir := filepath.Dir(s.reposFile())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := s.VerifyRecordTargets(); err != nil {
+		return err
+	}
+	lock := filepath.Join(dir, s.Namespace+".lock")
+	if err := acquireRecordLock(lock); err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(lock)
+		_ = os.Remove(dir)
+	}()
+	if err := s.VerifyRecordTargets(); err != nil {
+		return err
+	}
+	return fn()
+}
+
+func acquireRecordLock(path string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.Mkdir(path, 0o700)
+		if err == nil {
+			return nil
+		}
+		if os.IsNotExist(err) {
+			if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
+				return mkErr
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timed out waiting for ownership record lock %s", path)
+			}
+			continue
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 2*time.Minute {
+			if os.RemoveAll(path) == nil {
+				continue
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for ownership record lock %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+func (s *State) updateManagedRepos(mutate func([]ManagedRepo) []ManagedRepo) error {
+	return s.withRecordLock(func() error {
+		repos, err := s.managedReposUnlocked()
+		if err != nil {
+			return err
+		}
+		return s.writeManagedReposLocked(mutate(repos))
+	})
 }
 
 // RecordManagedRepo marks dir as cloned by aiv so a later --purge-repos can
@@ -338,18 +464,30 @@ func (s *State) RecordManagedRepo(dir, id string) error {
 		return err
 	}
 	abs = filepath.Clean(abs)
-	repos, err := s.ManagedRepos()
-	if err != nil {
-		return err
-	}
-	for i := range repos {
-		if repos[i].Path == abs {
-			repos[i].ID = id
-			return s.writeManagedRepos(repos)
+	return s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		out := make([]ManagedRepo, 0, len(repos)+1)
+		recorded := false
+		for _, repo := range repos {
+			if repo.Path != abs {
+				out = append(out, repo)
+				continue
+			}
+			if repo.ID == id {
+				// Keep Pending so an interrupted removal is not cancelled by
+				// a checkout that reappears at the same path.
+				out = append(out, repo)
+				recorded = true
+				continue
+			}
+			if repo.Pending {
+				out = append(out, repo)
+			}
 		}
-	}
-	repos = append(repos, ManagedRepo{Path: abs, ID: id})
-	return s.writeManagedRepos(repos)
+		if !recorded {
+			out = append(out, ManagedRepo{Path: abs, ID: id})
+		}
+		return out
+	})
 }
 
 // ForgetManagedRepo removes dir from the ownership records after its checkout
@@ -360,18 +498,59 @@ func (s *State) ForgetManagedRepo(dir string) error {
 		return err
 	}
 	abs = filepath.Clean(abs)
-	repos, err := s.ManagedRepos()
+	return s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		kept := make([]ManagedRepo, 0, len(repos))
+		for _, repo := range repos {
+			if repo.Path != abs {
+				kept = append(kept, repo)
+			}
+		}
+		return kept
+	})
+}
+
+// ForgetManagedRepoID removes only the record for one ownership id, keeping a
+// newer checkout recorded at the same path.
+func (s *State) ForgetManagedRepoID(dir, id string) error {
+	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
-	kept := make([]ManagedRepo, 0, len(repos))
-	for _, repo := range repos {
-		if repo.Path != abs {
-			kept = append(kept, repo)
+	abs = filepath.Clean(abs)
+	return s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		kept := make([]ManagedRepo, 0, len(repos))
+		for _, repo := range repos {
+			if repo.Path != abs || repo.ID != id {
+				kept = append(kept, repo)
+			}
 		}
+		return kept
+	})
+}
+
+// SetRepoPending records that removal of dir has started. It requires a
+// matching record so an unrecorded checkout is never treated as pending.
+func (s *State) SetRepoPending(dir, id string, pending bool) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
 	}
-	if len(kept) == len(repos) {
-		return nil
+	abs = filepath.Clean(abs)
+	found := false
+	err = s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		for i := range repos {
+			if repos[i].Path == abs && repos[i].ID == id {
+				repos[i].Pending = pending
+				found = true
+			}
+		}
+		return repos
+	})
+	if err != nil {
+		return err
 	}
-	return s.writeManagedRepos(kept)
+	if !found {
+		return fmt.Errorf("ownership record for %s is missing", dir)
+	}
+	return nil
 }
