@@ -16,7 +16,7 @@ native 编译由[可选候选工作流](../../../.github/workflows/native-candid
 | 手动试用 alias | 所选已推送分支；独立的非版本号 alias 和所选候选渠道 | 仅生成候选制品；发布会在写入版本标签之前被拒绝 |
 | 合格 Daily／Dev 的推进发布 | 仍对应当前默认分支 head 的准确成功候选 run／attempt | 用原始冻结制品发布带版本号的预发布和滚动入口 |
 | 手动 `release_preview=true` | 所选分支及准确的 `VERSION` | 执行正式发布验收并冻结制品，关闭发布 |
-| 推送 `v*` tag | 与 `VERSION` 一致，且提交在默认分支历史中 | 通过受保护审批后的正式 Release 或 RC 预发布 |
+| 推送 `v*` tag | 与 `VERSION` 一致，且指向 `main` 历史中的提交 | 通过受保护审批后的正式 Release 或 RC 预发布 |
 
 工作流合入默认分支 `develop` 后，GitHub 按计划触发 Daily。快照日期取原始运行创建时的 Asia/Shanghai 日期，重跑沿用。定时构建使用修订号 `1`，通过验收并回读 Release 附件后更新滚动入口。
 
@@ -52,7 +52,7 @@ PR 按改动路径选择 Linux 基础检查，包括版本和 release PR。集�
 
 - 定时 Daily 要求 `develop` 上依赖锁文件中的版本与 `VERSION` 一致。评审镜像 digest、上游源码提交和构建回执。手动 Daily 和 Dev 使用 `AIVISION_SIGNOZ_IMAGE`，或通过 `signoz_image` 参数指定经批准且包含两个 Linux 架构的 `ghcr.io/ob-labs/signoz-ob@sha256:...`。
 - 确认产品仓库已公开，并核对实际操作账户的 Package 和 Release 权限。即使 `publish=false`，候选也会向 GHCR 写入镜像数据。首次获授权的候选可能创建私有 Package，随后在部署 smoke 前停止。为五个 Package 配置仓库关联、工作流访问权限和公开可见性，再重跑候选，由镜像仓库门禁验证匿名访问。
-- 正式版／RC：为 `release` environment 配置 required reviewers，禁止自我审批并关闭管理员绕过。按 [Release 模板](../../../.github/RELEASE_TEMPLATE.md)为准确的 tag 准备无附件的中英双语草稿。受保护的发布任务定位草稿并回读核验附件，通过后才发布。
+- 正式版／RC：为 `release` environment 配置 required reviewers，禁止自我审批并关闭管理员绕过。如果环境只允许指定的标签，在推送新标签前，把该版本的完整标签加入环境部署规则。按 [Release 模板](../../../.github/RELEASE_TEMPLATE.md)为该标签准备无附件的中英双语草稿。受保护的发布任务定位草稿并回读核验附件，通过后才发布。
 - 可选的 `AIVISION_E2E_DOCKER_LINUX_RUNNER` 必须指向可信且足以运行完整系统的 Linux Docker runner。
 
 发布工作流验收五个核心服务。可选 OpenShell 安装见[沙箱插件指南](sandbox-plugins.md)。
@@ -211,6 +211,29 @@ aiv logs --namespace aivision -n 80 backend
 源码检查独立于发布准备。缺少 SigNoz 配置或镜像仓库权限会阻止制品生产，源码回归仍运行。源码 fixture 的 SigNoz v1 回读不等于候选的原生 Langfuse v1 回读。
 
 候选验收失败后使用 **Re-run all jobs**，确保 CLI、镜像和检查属于同一 attempt。Daily 保留快照日期及修订号。已接受内容改变时使用下一个修订号。失败后唯一候选镜像 tag 可能保留。
+
+### 恢复正式版或 RC 发布
+
+发布任务保存操作日志后中断时，使用原发布 tag、run ID 和 attempt 恢复。该 tag 所指提交须包含支持恢复的工作流。恢复任务从原运行读取发布制品、验收记录和发布日志，这些附件保留 14 天。
+
+先启动恢复任务。重跑原工作流会产生新的 attempt，并取代中断的 attempt。
+
+```bash
+RELEASE_TAG=vX.Y.Z
+FORMAL_RUN_ID=...
+FORMAL_RUN_ATTEMPT=...
+gh workflow run release-images.yml -R antgroup/ai-vision \
+  --ref "$RELEASE_TAG" -f recover_formal_run_id="$FORMAL_RUN_ID" \
+  -f recover_formal_run_attempt="$FORMAL_RUN_ATTEMPT"
+```
+
+由发起人以外的审核人在受保护的 `release` 环境中审批恢复任务。任务会核验原始 attempt，确认当前 tag 指向 `main` 历史中的原始源码提交，再继续发布冻结的制品。如果此前中断在候选验收阶段，按候选重跑流程处理。
+
+发布仍是草稿时，恢复任务会核验已审阅的标题、说明和每一份现有附件的字节，再上传缺失文件。附件重复、超出清单或上传不完整时，恢复会停止。Stable 已发布时，GitHub Latest 必须仍指向该 Release，每个 GHCR `:latest` alias 必须仍指向记录中的上一版或已验收的目标。恢复只推进尚未完成的 alias。已发布的 RC 仅做回读核验。
+
+上传返回 HTTP 502 时，GitHub 可能留下状态为 `starter`、大小为零的附件。发布器报告此情况后，先等发布作业停止。用日志中的 `release.release_id` 按 ID 读取 Release，确认它仍是原版本标签的草稿。确认该附件名称在原始冻结制品清单中，且草稿中只有一项同名附件。按附件 ID 重新读取，确认状态仍为 `starter`、大小仍为零。仅按数字 ID 删除这项占位附件，重新列出草稿附件，再用原 run ID 和 attempt 发起恢复。保留 `uploaded` 附件供恢复作业校验。 [GitHub Release 附件 API](https://docs.github.com/en/rest/releases/assets#upload-a-release-asset)
+
+### Daily 和 Dev 发布恢复
 
 Dev alias 附件上传中断后，可以用原候选的 run／attempt 重试推进发布。直接 `publish=true` 的候选若仅在开发发布作业失败，需设置 `recover_dev_publication=true`；校验器要求同一 attempt 的两个 smoke 和冻结验收均已通过，其他失败或取消仍会被拒绝。恢复会验证冻结验收、已发布的带版本制品、原 Dev 构建／源码入口和当前 tag，再恢复同一组字节。原候选说明保留，恢复发布器单独记录。较新、变化或来源无法验证的 alias 状态需要先检查。新的 Dev 发布会先回读上传后的附件，再写入完成说明。
 

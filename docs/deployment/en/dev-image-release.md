@@ -16,7 +16,7 @@ Native compilation is available through an [optional candidate workflow](../../.
 | Manual trial alias | Selected pushed branch; unique non-version alias and selected candidate channel | Candidate assets only; publication is rejected before version-tag writes |
 | Qualified Daily/Dev promotion | Exact successful candidate run/attempt, still at the current default-branch head | Versioned prerelease and rolling entry using the original frozen assets |
 | Manual `release_preview=true` | Selected branch and exact `VERSION` | Formal release qualification and frozen artifacts with publication disabled |
-| Push of a `v*` tag | Tag matches `VERSION` and is reachable from the default branch | Reviewed stable Release or RC prerelease after protected approval |
+| Push of a `v*` tag | Tag matches `VERSION` and identifies a commit in `main` history | Reviewed stable Release or RC prerelease after protected approval |
 
 GitHub schedules the Daily after this workflow reaches the default `develop` branch. The snapshot date comes from the original run creation time in Asia/Shanghai and stays fixed on reruns. Scheduled runs use revision `1`. After qualification, the workflow publishes the versioned prerelease, downloads and verifies its assets, then advances the rolling `daily` entry.
 
@@ -52,7 +52,7 @@ Confirm these prerequisites before expensive builds or publication:
 
 - For a scheduled Daily, keep the dependency lock matched to `VERSION` on `develop`. Review the image digest, upstream source commit, and build receipt. For manual Daily and Dev, set `AIVISION_SIGNOZ_IMAGE` or pass `signoz_image` with an approved `ghcr.io/ob-labs/signoz-ob@sha256:...` index containing both Linux architectures.
 - Confirm that the product repository is public and the intended actor has package and Release access. Candidate runs stage bytes in GHCR even when `publish=false`. The first authorized staging run can create private packages and stop before deployment smoke. Configure repository association, workflow access and public visibility for all five packages in GHCR. Then rerun the candidate so the registry gate can verify anonymous access.
-- For stable/RC, configure the `release` environment with required reviewers, prevention of self-review and administrator bypass disabled. Prepare an asset-free draft for the exact tag with reviewed English and Chinese notes using the [release template](../../../.github/RELEASE_TEMPLATE.md). The protected publishing job resolves that draft and verifies its uploaded assets before publication.
+- For stable/RC, configure the `release` environment with required reviewers, prevention of self-review and administrator bypass disabled. If deployment is restricted to selected tags, add the exact new version tag to the environment's deployment rules before pushing it. Prepare an asset-free draft for that tag with reviewed English and Chinese notes using the [release template](../../../.github/RELEASE_TEMPLATE.md). The protected publishing job resolves that draft and verifies its uploaded assets before publication.
 - An optional `AIVISION_E2E_DOCKER_LINUX_RUNNER` must identify a trusted Linux Docker runner with enough resources for the full stack.
 
 The release workflow qualifies the five core services. Optional OpenShell installation is documented separately in the [sandbox plugin guide](sandbox-plugins.md).
@@ -239,6 +239,29 @@ The latest published versioned product Release is the default reuse baseline; `r
 Source checks run independently of release preparation. Missing SigNoz configuration or registry access blocks artifact production, while source regressions still run. Source-fixture SigNoz v1 readback is not the candidate's native Langfuse v1 readback.
 
 If candidate qualification fails, use **Re-run all jobs** to keep CLI, images and checks within one attempt. Preserve the Daily snapshot date and revision. Changed accepted content requires the next revision. Unique candidate image tags can remain after failure.
+
+### Recover a formal release publication
+
+If Stable or RC publication was interrupted after the publisher saved its journal, use the original release tag, run ID and attempt. The tag must contain the recovery-capable workflow. The recovery run retrieves the original release assets, acceptance and journal, which the workflow retains for 14 days.
+
+Start recovery before rerunning the original workflow. A new attempt supersedes the interrupted attempt.
+
+```bash
+RELEASE_TAG=vX.Y.Z
+FORMAL_RUN_ID=...
+FORMAL_RUN_ATTEMPT=...
+gh workflow run release-images.yml -R antgroup/ai-vision \
+  --ref "$RELEASE_TAG" -f recover_formal_run_id="$FORMAL_RUN_ID" \
+  -f recover_formal_run_attempt="$FORMAL_RUN_ATTEMPT"
+```
+
+A reviewer other than the person who starts recovery approves the job in the protected `release` environment. The job verifies the original attempt and the live tag against the source commit in `main` history, then resumes publication using the frozen assets. For an earlier failure during qualification, follow the candidate rerun procedure.
+
+For a draft, recovery verifies the reviewed title and notes and the exact bytes of every existing attachment before uploading missing files. Duplicate, unexpected, or incomplete uploads stop recovery. If Stable has already published, GitHub Latest must still point to that Release, and each GHCR `:latest` alias must still match the recorded predecessor or the accepted target. Recovery moves only the unfinished aliases. An already-published RC is verified without updating aliases.
+
+An HTTP 502 during upload can leave a zero-byte attachment in the `starter` state. If the publisher reports one, wait for the publishing jobs to stop. Use `release.release_id` from the journal to read the Release by ID and verify it is still a draft for the original version tag. Check that the reported attachment is the only entry with that name and that the name appears in the original frozen assets. Re-read the attachment by ID and confirm its state is still `starter` and its size is zero. Delete just that placeholder by its numeric attachment ID, list the draft attachments again, then dispatch recovery with the original run ID and attempt. Leave `uploaded` attachments in place for the recovery job to verify. [GitHub release asset API](https://docs.github.com/en/rest/releases/assets#upload-a-release-asset)
+
+### Daily and Dev publication recovery
 
 Advancing `daily` requires both a newer workflow attempt and a product version that does not move backward. The publisher verifies the current version through its published versioned Release, authenticated manifest/checksum and live tags, then compares the numeric base version, snapshot date and revision. A later run cannot replace a newer date or revision; unknown or inconsistent prior provenance stops publication.
 

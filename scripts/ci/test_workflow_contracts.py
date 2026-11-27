@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 from plan import CHECKS, FAMILIES, make_plan
@@ -256,7 +257,9 @@ class WorkflowGateTests(unittest.TestCase):
 
     def test_public_daily_runs_full_source_checks_with_verified_candidate_images(self):
         jobs = workflow("release-images.yml")["jobs"]
-        self.assertEqual(jobs["prepare"]["if"], "github.repository == 'antgroup/ai-vision'")
+        self.assertEqual(jobs["prepare"]["if"].strip(),
+                         "github.repository == 'antgroup/ai-vision' && "
+                         "!inputs.recover_formal_run_id && !inputs.recover_formal_run_attempt")
         self.assertNotIn("source-checks", jobs)
         self.assertNotIn("include_openshell", triggers(workflow("release-images.yml"))["workflow_dispatch"]["inputs"])
         full = jobs["public-source-checks"]
@@ -310,6 +313,47 @@ class WorkflowGateTests(unittest.TestCase):
             name, _, value = output.read_text().partition("=")
             self.assertEqual(name, "AIVISION_SEEKDB_SMOKE_IMAGES_JSON")
             self.assertEqual(json.loads(value), {key: ref for key, ref in images.items() if key != "oceanbase"})
+
+    def test_formal_recovery_reuses_the_publication_lock_and_approval(self):
+        document = workflow("release-images.yml")
+        jobs = document["jobs"]
+        normal = jobs["publish-stable"]
+        recovery = jobs["recover-formal"]
+        validation = jobs["validate-formal-recovery"]
+        self.assertEqual(recovery["environment"], normal["environment"])
+        self.assertEqual(recovery["concurrency"], normal["concurrency"])
+        self.assertEqual(recovery["permissions"], normal["permissions"])
+        self.assertEqual(recovery["needs"], "validate-formal-recovery")
+        self.assertNotIn("environment", validation)
+        self.assertIn("github.event_name == 'workflow_dispatch'", validation["if"])
+        inputs = triggers(document)["workflow_dispatch"]["inputs"]
+        for name in ("recover_formal_run_id", "recover_formal_run_attempt"):
+            self.assertIs(inputs[name]["required"], False)
+            self.assertIn(f"inputs.{name}", validation["if"])
+        journal = next(step for step in normal["steps"] if step.get("uses") == "actions/upload-artifact@v4")
+        self.assertEqual(journal["with"]["name"], "formal-publication-${{ github.run_attempt }}")
+        self.assertEqual(journal["with"]["retention-days"], 14)
+        self.assertIn("preflight --directory release", normal["steps"][-3]["run"])
+        self.assertIn("--formal-journal formal-publication.json", normal["steps"][-1]["run"])
+        self.assertIn("--recover-formal", recovery["steps"][-1]["run"])
+
+    def test_formal_recovery_validates_ref_and_inputs_before_approval(self):
+        step = workflow("release-images.yml")["jobs"]["validate-formal-recovery"]["steps"][0]
+        for ref, run_id, attempt, error in (
+            ("refs/heads/develop", "12", "1", "original version tag"),
+            ("refs/tags/v0.6.1", "12", "", "both the original run ID and attempt"),
+            ("refs/tags/v0.6.1", "", "1", "both the original run ID and attempt"),
+            ("refs/tags/v0.6.1", "12", "01", "both the original run ID and attempt"),
+            ("refs/tags/v0.6.1-rc.1", "12", "1", None),
+        ):
+            with self.subTest(ref=ref, run_id=run_id, attempt=attempt), patch.dict(os.environ, GITHUB_REF=ref):
+                result, _ = run_step(step, inputs={"recover_formal_run_id": run_id,
+                                                   "recover_formal_run_attempt": attempt})
+                if error:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(error, result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_public_release_candidates_cannot_write_aliases_without_publication(self):
         document = workflow("release-images.yml")
