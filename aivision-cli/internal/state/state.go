@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,7 +19,6 @@ import (
 	"time"
 
 	"github.com/antgroup/ai-vision/aivision-cli/internal/blueprint"
-	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
 // State tracks everything aiv persists about a deployment so that status,
@@ -193,40 +193,78 @@ func (s *State) LoadVars() (map[string]string, error) {
 	return out, nil
 }
 
-// VerifyPurgeTarget checks that the state root is a real child of the
-// configured workdir, so a namespace such as "..", "." or an absolute path
-// can never widen the delete.
+// VerifyPurgeTarget checks the namespace directory before teardown begins.
 func (s *State) VerifyPurgeTarget() error {
-	if s.Workdir == "" {
-		return fmt.Errorf("refusing to purge %s: state root has no workdir", s.Root)
+	work, err := s.openPurgeParent()
+	if work != nil {
+		return work.Close()
 	}
-	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.Root); err != nil {
-		return fmt.Errorf("refusing to purge state dir: %w", err)
-	}
-	return nil
+	return err
 }
 
 // RemoveAll deletes the entire namespace state root (destroy --purge).
 func (s *State) RemoveAll() error {
-	if err := s.VerifyPurgeTarget(); err != nil {
+	work, err := s.openPurgeParent()
+	if err != nil || work == nil {
 		return err
 	}
-	workRoot, err := os.OpenRoot(s.Workdir)
+	defer work.Close()
+	return work.RemoveAll(s.Namespace)
+}
+
+// openPurgeParent returns nil if there is no namespace directory. All lookups
+// and the final removal use the selected workdir handle and one direct child.
+func (s *State) openPurgeParent() (*os.Root, error) {
+	if err := blueprint.ValidateNamespace(s.Namespace); err != nil {
+		return nil, err
+	}
+	if s.Workdir == "" || s.Root != filepath.Join(s.Workdir, s.Namespace) {
+		return nil, fmt.Errorf("state root %s does not match namespace %s under %s", s.Root, s.Namespace, s.Workdir)
+	}
+	work, err := os.OpenRoot(s.Workdir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
+		return nil, err
+	}
+	info, err := work.Lstat(s.Namespace)
+	if err != nil {
+		_ = work.Close()
 		if os.IsNotExist(err) {
-			return nil
+			return nil, nil
 		}
-		return err
+		return nil, err
 	}
-	defer workRoot.Close()
-	rel, err := filepath.Rel(s.Workdir, s.Root)
-	if err != nil {
-		return err
+	if !info.IsDir() {
+		_ = work.Close()
+		return nil, fmt.Errorf("state root %s is not a namespace directory", s.Root)
 	}
-	if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("%s is outside %s", s.Root, s.Workdir)
+	// Lstat also succeeds with another namespace's spelling on a
+	// case-insensitive filesystem. Registries and resource names retain case.
+	alternate := strings.ToLower(s.Namespace)
+	if alternate == s.Namespace {
+		alternate = strings.ToUpper(s.Namespace)
 	}
-	return workRoot.RemoveAll(rel)
+	if alternate == s.Namespace {
+		return work, nil // no letters to fold
+	}
+	alias, err := work.Lstat(alternate)
+	if os.IsNotExist(err) || (err == nil && !os.SameFile(info, alias)) {
+		return work, nil // distinct names on this filesystem
+	}
+	// Only a shared entry needs its original spelling from the directory.
+	entries, err := fs.ReadDir(work.FS(), ".")
+	if err == nil {
+		for _, entry := range entries {
+			if entry.Name() == s.Namespace && entry.IsDir() {
+				return work, nil
+			}
+		}
+		err = fmt.Errorf("namespace %q does not exactly match a directory name in %s", s.Namespace, s.Workdir)
+	}
+	_ = work.Close()
+	return nil, err
 }
 
 // ManagedRepo records a checkout aiv cloned. ID matches the ownership marker
@@ -242,121 +280,158 @@ type ManagedRepo struct {
 // reposFile lives outside the namespace root so a state-only --purge keeps
 // the ownership records needed by a later --purge-repos.
 func (s *State) reposFile() string {
-	return filepath.Join(s.Workdir, ".aivision-repos", namespaceKey(s.Namespace)+".json")
+	// The leading dot is invalid in a namespace. Keep these records distinct
+	// from the unprefixed names used in unreleased builds.
+	return filepath.Join(s.recordDir(), "."+namespaceKey(s.Namespace)+".json")
 }
 
 func namespaceKey(namespace string) string {
 	sum := sha256.Sum256([]byte(namespace))
-	return hex.EncodeToString(sum[:8])
+	return hex.EncodeToString(sum[:20])
 }
-
-// maxRecordBasename is the common NAME_MAX used to decide whether a
-// namespace-derived legacy record name can exist on the filesystem.
-const maxRecordBasename = 255
 
 // legacyReposFile is the record location used before records moved out of the
 // purgeable state directory.
 func (s *State) legacyReposFile() string { return filepath.Join(s.StateDir, "repos.json") }
 
-// namedReposFile is the pre-hash record name. It stays readable so an
-// upgrade does not lose the ownership records of existing clones.
-func (s *State) namedReposFile() string {
-	return filepath.Join(s.recordDir(), s.Namespace+".json")
-}
-
-// VerifyRecordTargets keeps both record locations inside their intended
-// storage: current records inside workdir, legacy records inside the state
-// root. Callers check this before writing, cleaning up or tearing down.
+// VerifyRecordTargets checks both record locations before teardown.
 func (s *State) VerifyRecordTargets() error {
-	if s.Workdir == "" {
-		return fmt.Errorf("ownership records have no workdir")
+	store, err := s.openRecordStore(false)
+	if err != nil || store == nil {
+		return err
 	}
-	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.Root); err != nil {
-		return fmt.Errorf("refusing ownership records: %w", err)
-	}
-	if err := pathguard.EnsureStrictlyWithin(s.Workdir, s.reposFile()); err != nil {
-		return fmt.Errorf("refusing ownership records: %w", err)
-	}
-	if err := pathguard.EnsureStrictlyWithin(s.Root, s.legacyReposFile()); err != nil {
-		return fmt.Errorf("refusing legacy ownership records: %w", err)
-	}
-	return nil
+	return store.Close()
 }
 
-// recordStore binds record operations to the per-deployment record directory
-// that was validated. os.Root keeps every operation inside it even if a path
-// component is swapped for a symlink after the check.
 type recordStore struct {
-	root    *os.Root // <workdir>/.aivision-repos; nil when it does not exist
-	work    *os.Root // workdir
-	base    string
-	workdir string
+	root       *os.Root // <workdir>/.aivision-repos
+	work       *os.Root // workdir
+	deployment *os.Root // <workdir>/<namespace>
+	legacy     *os.Root // <workdir>/<namespace>/state
+	base       string
+	namespace  string
 }
 
 func (s *State) recordDir() string { return filepath.Join(s.Workdir, ".aivision-repos") }
 
 func (s *State) openRecordStore(create bool) (*recordStore, error) {
-	if err := s.VerifyRecordTargets(); err != nil {
+	if err := s.VerifyPurgeTarget(); err != nil {
 		return nil, err
 	}
-	work, err := os.OpenRoot(s.Workdir)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
-		}
+	info, err := os.Stat(s.Workdir)
+	if os.IsNotExist(err) {
 		if !create {
 			return nil, nil
 		}
 		if err := os.MkdirAll(s.Workdir, 0o755); err != nil {
 			return nil, fmt.Errorf("create workdir %s: %w", s.Workdir, err)
 		}
-		if work, err = os.OpenRoot(s.Workdir); err != nil {
-			return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
-		}
+		info, err = os.Stat(s.Workdir)
 	}
-	store := &recordStore{work: work, workdir: s.Workdir, base: s.recordDir()}
-	rel, err := store.workRel(store.base)
 	if err != nil {
-		_ = work.Close()
+		return nil, fmt.Errorf("inspect workdir %s: %w", s.Workdir, err)
+	}
+	work, err := os.OpenRoot(s.Workdir)
+	if err != nil {
+		return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
+	}
+	store := &recordStore{work: work, base: s.recordDir(), namespace: s.Namespace}
+	if err := verifyOpenedDirectory(work, info, nil); err != nil {
+		_ = store.Close()
 		return nil, err
 	}
-	info, err := work.Lstat(rel)
+	if store.root, err = openRecordDirectory(work, filepath.Base(store.base), create); err == nil {
+		store.deployment, err = openRecordDirectory(work, s.Namespace, false)
+	}
+	if err == nil && store.deployment != nil {
+		store.legacy, err = openRecordDirectory(store.deployment, "state", false)
+	}
 	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			_ = work.Close()
-			return nil, fmt.Errorf("record directory %s is not a regular directory", store.base)
-		}
-	} else if os.IsNotExist(err) {
-		if !create {
-			return store, nil
-		}
-		if err := work.Mkdir(rel, 0o755); err != nil {
-			if !os.IsExist(err) {
-				_ = work.Close()
-				return nil, fmt.Errorf("create record directory %s: %w", store.base, err)
-			}
-			info, statErr := work.Lstat(rel)
-			if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-				_ = work.Close()
-				return nil, fmt.Errorf("record directory %s is not a regular directory", store.base)
-			}
-		}
-	} else {
-		_ = work.Close()
-		return nil, fmt.Errorf("inspect record directory %s: %w", store.base, err)
+		err = store.verify()
 	}
-	root, err := work.OpenRoot(rel)
 	if err != nil {
-		_ = work.Close()
-		return nil, fmt.Errorf("open record directory %s: %w", store.base, err)
+		_ = store.Close()
+		return nil, err
 	}
-	store.root = root
 	return store, nil
 }
 
+// Open a direct child and compare the resulting directory with the inspected
+// entry. The comparison rejects a replacement between inspection and open.
+func openRecordDirectory(parent *os.Root, name string, create bool) (*os.Root, error) {
+	info, err := parent.Lstat(name)
+	if os.IsNotExist(err) && create {
+		if err := parent.Mkdir(name, 0o755); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+		info, err = parent.Lstat(name)
+	}
+	if os.IsNotExist(err) && !create {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("ownership storage %s is not a directory", filepath.Join(parent.Name(), name))
+	}
+	dir, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyOpenedDirectory(dir, info, nil); err != nil {
+		_ = dir.Close()
+		return nil, err
+	}
+	return dir, nil
+}
+
+func verifyOpenedDirectory(dir *os.Root, want os.FileInfo, err error) error {
+	if dir == nil {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	actual, err := dir.Stat(".")
+	if err != nil {
+		return err
+	}
+	if !want.IsDir() || !os.SameFile(want, actual) {
+		return fmt.Errorf("ownership storage %s changed during operation", dir.Name())
+	}
+	return nil
+}
+
+func (r *recordStore) verify() error {
+	info, err := os.Stat(r.work.Name())
+	if err := verifyOpenedDirectory(r.work, info, err); err != nil {
+		return err
+	}
+	for _, dir := range []struct {
+		parent, opened *os.Root
+		name           string
+	}{
+		{r.work, r.root, filepath.Base(r.base)},
+		{r.work, r.deployment, r.namespace},
+		{r.deployment, r.legacy, "state"},
+	} {
+		if dir.opened == nil {
+			continue
+		}
+		info, err := dir.parent.Lstat(dir.name)
+		if err := verifyOpenedDirectory(dir.opened, info, err); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *recordStore) Close() error {
-	if r.root != nil {
-		_ = r.root.Close()
+	for _, dir := range []*os.Root{r.legacy, r.deployment, r.root} {
+		if dir != nil {
+			_ = dir.Close()
+		}
 	}
 	return r.work.Close()
 }
@@ -374,75 +449,73 @@ func relWithin(root, path string) (string, error) {
 
 func (r *recordStore) rel(path string) (string, error) { return relWithin(r.base, path) }
 
-func (r *recordStore) workRel(path string) (string, error) {
-	return relWithin(r.workdir, path)
-}
-
-func (r *recordStore) readFile(path string) ([]byte, bool, error) {
-	if r.root == nil {
+func readRecordFile(root *os.Root, name string) ([]byte, bool, error) {
+	if root == nil {
 		return nil, false, nil
 	}
-	rel, err := r.rel(path)
-	if err != nil {
-		return nil, false, err
-	}
-	b, err := r.root.ReadFile(rel)
-	if err != nil {
+	// A namespace writer may replace the file between inspection and open.
+	// Retry that case, and read only from the inspected regular file.
+	for range 3 {
+		info, err := root.Lstat(name)
 		if os.IsNotExist(err) {
 			return nil, false, nil
 		}
-		return nil, false, err
-	}
-	return b, true, nil
-}
-
-// readWorkFile reads the legacy record that predates the record directory.
-func (r *recordStore) readWorkFile(path string) ([]byte, bool, error) {
-	rel, err := r.workRel(path)
-	if err != nil {
-		return nil, false, err
-	}
-	f, err := r.work.Open(rel)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
+		if err != nil {
+			return nil, false, err
 		}
-		return nil, false, err
+		if !info.Mode().IsRegular() {
+			return nil, false, fmt.Errorf("ownership record %s is not a regular file", name)
+		}
+		f, err := root.Open(name)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		opened, err := f.Stat()
+		if err == nil && os.SameFile(info, opened) {
+			b, err := io.ReadAll(f)
+			_ = f.Close()
+			return b, err == nil, err
+		}
+		_ = f.Close()
+		if err != nil {
+			return nil, false, err
+		}
 	}
-	defer f.Close()
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return nil, false, err
-	}
-	return b, true, nil
+	return nil, false, fmt.Errorf("ownership record %s changed while opening it", name)
 }
 
-func (r *recordStore) remove(path string) error {
-	if r.root == nil {
-		return nil
-	}
-	rel, err := r.rel(path)
+func verifyRecordFile(root *os.Root, name string, file *os.File) error {
+	info, err := root.Lstat(name)
 	if err != nil {
 		return err
 	}
-	if err := r.root.Remove(rel); err != nil && !os.IsNotExist(err) {
+	opened, err := file.Stat()
+	if err != nil {
 		return err
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return fmt.Errorf("ownership file %s changed while opening it", name)
 	}
 	return nil
 }
 
-func (r *recordStore) removeWork(path string) error {
-	rel, err := r.workRel(path)
-	if err != nil {
-		return err
+func removeRecordFile(root *os.Root, name string) error {
+	if root == nil {
+		return nil
 	}
-	if err := r.work.Remove(rel); err != nil && !os.IsNotExist(err) {
+	if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
 }
 
 func (r *recordStore) writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	if err := r.verify(); err != nil {
+		return err
+	}
 	rel, err := r.rel(path)
 	if err != nil {
 		return err
@@ -480,6 +553,9 @@ func (r *recordStore) writeFileAtomic(path string, data []byte, perm os.FileMode
 		return err
 	}
 	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := r.verify(); err != nil {
 		return err
 	}
 	if err := r.root.Rename(tmpRel, rel); err != nil {
@@ -524,6 +600,9 @@ func (s *State) ManagedRepos() ([]ManagedRepo, error) {
 }
 
 func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
+	if err := store.verify(); err != nil {
+		return nil, err
+	}
 	var out []ManagedRepo
 	seen := map[string]bool{}
 	seenPath := map[string]bool{}
@@ -554,22 +633,15 @@ func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 		}
 		return nil
 	}
-	named := s.namedReposFile()
-	type repoSource struct {
+	sources := []struct {
 		path string
-		read func(string) ([]byte, bool, error)
-	}
-	sources := []repoSource{
-		{s.reposFile(), store.readFile},
-		{s.legacyReposFile(), store.readWorkFile},
-	}
-	if len(filepath.Base(named)) <= maxRecordBasename {
-		if _, err := store.rel(named); err == nil {
-			sources = append(sources, repoSource{named, store.readFile})
-		}
+		root *os.Root
+	}{
+		{s.reposFile(), store.root},
+		{s.legacyReposFile(), store.legacy},
 	}
 	for _, source := range sources {
-		b, exists, err := source.read(source.path)
+		b, exists, err := readRecordFile(source.root, filepath.Base(source.path))
 		if err != nil {
 			return nil, err
 		}
@@ -580,45 +652,36 @@ func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 			return nil, err
 		}
 	}
-	return out, nil
+	return out, store.verify()
 }
 
 func (s *State) writeManagedReposLocked(store *recordStore, repos []ManagedRepo) error {
-	path := s.reposFile()
+	if err := store.verify(); err != nil {
+		return err
+	}
 	if len(repos) == 0 {
-		if err := store.remove(path); err != nil {
+		if err := removeRecordFile(store.root, filepath.Base(s.reposFile())); err != nil {
 			return err
 		}
-		s.removeNamedRepos(store)
-		_ = store.removeWork(s.legacyReposFile())
-		return nil
+		return removeRecordFile(store.legacy, filepath.Base(s.legacyReposFile()))
 	}
 	b, err := json.MarshalIndent(repos, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := store.writeFileAtomic(path, b, 0o644); err != nil {
+	if err := store.writeFileAtomic(s.reposFile(), b, 0o644); err != nil {
 		return err
 	}
-	s.removeNamedRepos(store)
-	_ = store.removeWork(s.legacyReposFile())
-	return nil
-}
-
-func (s *State) removeNamedRepos(store *recordStore) {
-	path := s.namedReposFile()
-	if len(filepath.Base(path)) > maxRecordBasename {
-		return
+	if err := store.verify(); err != nil {
+		return err
 	}
-	if _, err := store.rel(path); err == nil {
-		_ = store.remove(path)
-	}
+	return removeRecordFile(store.legacy, filepath.Base(s.legacyReposFile()))
 }
 
 var recordMutexes sync.Map
 
 func (s *State) lockFile() string {
-	return filepath.Join(s.Workdir, ".aivision-"+namespaceKey(s.Namespace)+".lock")
+	return filepath.Join(s.recordDir(), ".namespace-"+namespaceKey(s.Namespace)+".lock")
 }
 
 // withRecordLock serialises ownership-record updates across CLI processes.
@@ -631,40 +694,23 @@ func (s *State) withRecordLock(fn func(*recordStore) error) error {
 	}
 	defer store.Close()
 	lockPath := s.lockFile()
-	if err := pathguard.EnsureStrictlyWithin(s.Workdir, lockPath); err != nil {
-		return fmt.Errorf("refusing ownership record lock: %w", err)
-	}
-	lockRel, err := store.workRel(lockPath)
-	if err != nil {
-		return err
-	}
 	muAny, _ := recordMutexes.LoadOrStore(lockPath, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
-	release, err := acquireRecordLock(store, lockRel)
+	release, err := acquireRecordLock(store, filepath.Base(lockPath))
 	if err != nil {
 		return err
 	}
-	// The record directory is retained on purpose: a process waiting for this
-	// lock may already hold an os.Root handle on it, and removing the directory
-	// would make that process write into an unlinked directory.
-	defer func() {
-		release()
-		if store.root != nil {
-			_ = store.root.Close()
-			store.root = nil
-		}
-	}()
-	if err := s.VerifyRecordTargets(); err != nil {
+	defer release()
+	if err := store.verify(); err != nil {
 		return err
 	}
 	return fn(store)
 }
 
 // AcquireRepoRemovalLock serialises removal of one recorded checkout across
-// CLI processes. The lock file lives in workdir, not in the state directory or
-// the record directory, so it survives --purge and never blocks record cleanup.
+// CLI processes. The lock lives with the records and survives state purge.
 func (s *State) AcquireRepoRemovalLock(dir, id string) (func(), error) {
 	store, err := s.openRecordStore(true)
 	if err != nil {
@@ -676,18 +722,13 @@ func (s *State) AcquireRepoRemovalLock(dir, id string) (func(), error) {
 		return nil, err
 	}
 	sum := sha256.Sum256([]byte(filepath.Clean(abs) + "\x00" + id))
-	lockPath := filepath.Join(s.Workdir, ".aivision-removal-"+hex.EncodeToString(sum[:8])+".lock")
-	if err := pathguard.EnsureStrictlyWithin(s.Workdir, lockPath); err != nil {
-		_ = store.Close()
-		return nil, fmt.Errorf("refusing repo removal lock: %w", err)
-	}
-	rel, err := store.workRel(lockPath)
+	release, err := acquireRecordLock(store, ".removal-"+hex.EncodeToString(sum[:8])+".lock")
 	if err != nil {
 		_ = store.Close()
 		return nil, err
 	}
-	release, err := acquireRecordLock(store, rel)
-	if err != nil {
+	if err := store.verify(); err != nil {
+		release()
 		_ = store.Close()
 		return nil, err
 	}

@@ -1,16 +1,15 @@
 package runtime
 
 import (
-	"github.com/antgroup/ai-vision/aivision-cli/internal/deploy/components"
-
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"sort"
 
+	"github.com/antgroup/ai-vision/aivision-cli/internal/deploy/components"
 	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
 )
 
@@ -28,12 +27,13 @@ type DestroyOpts struct {
 // state so a later cast comes back up fast. --purge additionally removes named
 // volumes (wiping the OceanBase datastore) and the state directory.
 func (a *App) Destroy(opts DestroyOpts) error {
-	if err := a.checkDeploymentDriver(); err != nil {
+	volumeNames, err := a.checkedDeploymentVolumes()
+	if err != nil {
 		return err
 	}
 	if opts.Purge {
-		if err := a.State.VerifyPurgeTarget(); err != nil {
-			return fmt.Errorf("remove state: %w", err)
+		if err := a.VerifyStatePurge(); err != nil {
+			return err
 		}
 	}
 	a.Log.Step("destroy: tearing down namespace %s (purge=%v)", a.BP.Metadata.Namespace, opts.Purge)
@@ -56,14 +56,8 @@ func (a *App) Destroy(opts DestroyOpts) error {
 		}
 		if repos != nil {
 			defer repos.Close()
-			repoPlan, err = a.repoPurgePlan(repos)
+			repoPlan, err = a.repoPurgePlan(repos, opts.ConfirmedRepos)
 			if err != nil {
-				return err
-			}
-			if opts.ConfirmedRepos != nil {
-				repoPlan = confirmedRepoPlan(repoPlan, opts.ConfirmedRepos)
-			}
-			if err := a.cleanupRepoRecords(repos, repoPlan); err != nil {
 				return err
 			}
 		}
@@ -115,28 +109,37 @@ func (a *App) Destroy(opts DestroyOpts) error {
 			} else {
 				a.Log.Info("%s container absent", components.Canonical(c.Name))
 			}
-			if opts.Purge {
-				for _, v := range c.Volumes {
-					vol := expand(v, vars)
-					if idx := strings.IndexByte(vol, ':'); idx > 0 {
-						vol = vol[:idx]
-					}
-					if vol == "" {
-						continue
-					}
-					a.Log.Info("removing volume %s", vol)
-					_, _ = a.Docker.Run(a.Ctx, false, "volume", "rm", "-f", vol)
+		}
+	}
+
+	// Shared volumes can still be in use until every component is down.
+	// Keep the namespace and checkout records available if a retry is needed.
+	if opts.Purge {
+		for _, name := range volumeNames {
+			exists, err := a.checkPhysicalOwner("volume", name)
+			if err != nil {
+				return err
+			}
+			if exists {
+				a.Log.Info("removing volume %s", name)
+				if _, err := a.Docker.Run(a.Ctx, false, "volume", "rm", "-f", name); err != nil {
+					return fmt.Errorf("remove Docker volume %s: %w", name, err)
 				}
 			}
 		}
 	}
-
 	if opts.PurgeRepos && repos != nil {
+		if err := a.cleanupRepoRecords(repos, repoPlan); err != nil {
+			return err
+		}
 		if err := a.removeManagedRepos(repos, repoPlan.candidates); err != nil {
 			return err
 		}
 	}
 	if opts.Purge {
+		if err := a.VerifyStatePurge(); err != nil {
+			return err
+		}
 		a.Log.Info("purging state dir %s", a.State.Root)
 		if err := a.State.RemoveAll(); err != nil {
 			return fmt.Errorf("remove state: %w", err)
@@ -168,7 +171,8 @@ func (a *App) PurgeRepoPreview() ([]string, error) {
 	return paths, nil
 }
 
-// PurgeRepoPlan returns the records the user is asked to confirm.
+// PurgeRepoPlan returns the records the user is asked to confirm. An empty
+// result still limits execution to the confirmed plan.
 func (a *App) PurgeRepoPlan() ([]ManagedRepo, error) {
 	repos, err := openRepoFS(a.SourceRoot())
 	if err != nil {
@@ -176,12 +180,12 @@ func (a *App) PurgeRepoPlan() ([]ManagedRepo, error) {
 			if err := a.validateBlueprintRepos(); err != nil {
 				return nil, err
 			}
-			return nil, nil
+			return []ManagedRepo{}, nil
 		}
 		return nil, err
 	}
 	defer repos.Close()
-	plan, err := a.repoPurgePlan(repos)
+	plan, err := a.repoPurgePlan(repos, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -192,28 +196,26 @@ func (a *App) PurgeRepoPlan() ([]ManagedRepo, error) {
 
 func confirmedRepoPlan(plan repoPurgePlan, confirmed []ManagedRepo) repoPurgePlan {
 	want := make(map[string]bool, len(confirmed))
-	wantPath := make(map[string]bool, len(confirmed))
 	for _, repo := range confirmed {
 		want[repoKey(repo)] = true
-		wantPath[repo.Path] = true
 	}
 	out := repoPurgePlan{kept: plan.kept, retire: plan.retire}
-	matched := map[string]bool{}
-	orphanPath := map[string]bool{}
 	for _, repo := range plan.candidates {
-		if want[repoKey(repo)] {
+		key := repoKey(repo)
+		if want[key] {
 			out.candidates = append(out.candidates, repo)
-			matched[repoKey(repo)] = true
+			delete(want, key)
 		}
 	}
 	for _, repo := range plan.orphans {
-		if wantPath[repo.Path] {
+		key := repoKey(repo)
+		if want[key] {
 			out.orphans = append(out.orphans, repo)
-			orphanPath[repo.Path] = true
+			delete(want, key)
 		}
 	}
 	for _, repo := range confirmed {
-		if !matched[repoKey(repo)] && !orphanPath[repo.Path] {
+		if want[repoKey(repo)] {
 			out.kept = append(out.kept, repo.Path+" (confirmed removal is no longer eligible)")
 		}
 	}
@@ -245,7 +247,7 @@ func (a *App) validateBlueprintRepos() error {
 // repoPurgePlan validates every repository path before anything is deleted.
 // Blueprint paths outside sourceRoot are rejected; unusable records are kept
 // so they cannot block cleanup of other eligible checkouts.
-func (a *App) repoPurgePlan(fs *repoFS) (repoPurgePlan, error) {
+func (a *App) repoPurgePlan(fs *repoFS, confirmed []ManagedRepo) (repoPurgePlan, error) {
 	var plan repoPurgePlan
 	if err := a.validateBlueprintRepos(); err != nil {
 		return plan, err
@@ -271,6 +273,9 @@ func (a *App) repoPurgePlan(fs *repoFS) (repoPurgePlan, error) {
 		if repo.ID == "" {
 			plan.kept = append(plan.kept, repo.Path+" (no verified ownership id)")
 			continue
+		}
+		if err := a.verifyCheckoutPurge(repo.Path); err != nil {
+			return plan, err
 		}
 		tombstone := a.purgeTombstone(repo)
 		if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), tombstone); err != nil {
@@ -309,22 +314,57 @@ func (a *App) repoPurgePlan(fs *repoFS) (repoPurgePlan, error) {
 		} else if !os.IsNotExist(err) {
 			return plan, fmt.Errorf("inspect pending removal %s: %w", tombstone, err)
 		}
-		if _, err := fs.lstat(purgeMarkerPath(tombstone)); err == nil {
-			if !fs.purgeMarkerMatches(tombstone, repo) {
-				plan.kept = append(plan.kept, repo.Path+" (removal marker belongs to another record)")
-				continue
-			}
-		} else if !os.IsNotExist(err) {
+		if _, owner, err := fs.inspectPurgeMarker(tombstone, repo); err != nil {
 			return plan, fmt.Errorf("inspect removal marker %s: %w", purgeMarkerPath(tombstone), err)
+		} else if owner == repoOwnerDifferent {
+			plan.kept = append(plan.kept, repo.Path+" (removal marker belongs to another record)")
+			continue
 		}
 		plan.candidates = append(plan.candidates, repo)
 	}
+	if confirmed != nil {
+		plan = confirmedRepoPlan(plan, confirmed)
+	}
+	// A nested clone must be removed independently before its parent.
+	sort.SliceStable(plan.candidates, func(i, j int) bool {
+		return len(plan.candidates[i].Path) > len(plan.candidates[j].Path)
+	})
+	eligible := make(map[string]bool)
+	filtered := plan.candidates[:0]
+	for _, repo := range plan.candidates {
+		tree := repo.Path
+		if repo.Pending {
+			tomb := a.purgeTombstone(repo)
+			if _, err := fs.lstat(tomb); err == nil {
+				tree = tomb
+			} else if !os.IsNotExist(err) {
+				return plan, err
+			}
+		}
+		child, err := a.nestedCheckout(fs, repo.Path, tree, eligible, repos)
+		if err != nil {
+			return plan, err
+		}
+		if child != "" {
+			plan.kept = append(plan.kept, repo.Path+" (contains separate checkout "+child+")")
+			continue
+		}
+		filtered = append(filtered, repo)
+		if !repo.Pending {
+			eligible[repo.Path] = true
+		}
+	}
+	plan.candidates = filtered
 	return plan, nil
 }
 
 func (a *App) addPendingCandidate(plan *repoPurgePlan, fs *repoFS, repo ManagedRepo, tombstone string) error {
 	if _, err := fs.lstat(tombstone); err == nil {
-		if !fs.purgeMarkerOwnsTombstone(tombstone, repo) {
+		owned, err := fs.purgeMarkerOwnsTombstone(tombstone, repo)
+		if err != nil {
+			return fmt.Errorf("verify pending directory %s: %w", tombstone, err)
+		}
+		if !owned {
 			plan.kept = append(plan.kept, repo.Path+" (pending removal path is not owned by this record)")
 			return nil
 		}
@@ -332,6 +372,12 @@ func (a *App) addPendingCandidate(plan *repoPurgePlan, fs *repoFS, repo ManagedR
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect pending removal %s: %w", tombstone, err)
+	}
+	if _, owner, err := fs.inspectPurgeMarker(tombstone, repo); err != nil {
+		return fmt.Errorf("inspect removal marker %s: %w", purgeMarkerPath(tombstone), err)
+	} else if owner == repoOwnerDifferent {
+		plan.kept = append(plan.kept, repo.Path+" (removal marker belongs to another record)")
+		return nil
 	}
 	if _, err := fs.lstat(repo.Path); err == nil {
 		owner, err := fs.inspectRepoOwner(repo.Path, repo.ID)
@@ -376,6 +422,12 @@ type purgeMarkerRecord struct {
 // the checkout is renamed, so a resumed cleanup never deletes an unrelated
 // directory that happens to use the same name.
 func (a *App) beginPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone string, alreadyPending bool) error {
+	if err := a.verifyNestedCheckouts(fs, repo.Path, repo.Path); err != nil {
+		return err
+	}
+	if err := a.verifyCheckoutPurge(repo.Path); err != nil {
+		return err
+	}
 	if !alreadyPending {
 		claimed, err := a.State.ClaimRepoPending(repo.Path, repo.ID)
 		if err != nil {
@@ -386,12 +438,9 @@ func (a *App) beginPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone string
 		}
 	}
 	if err := fs.writePurgeMarker(tombstone, repo); err != nil {
-		_ = a.State.SetRepoPending(repo.Path, repo.ID, false)
 		return fmt.Errorf("mark pending removal %s: %w", tombstone, err)
 	}
-	if err := fs.rename(repo.Path, tombstone); err != nil {
-		_ = fs.remove(purgeMarkerPath(tombstone))
-		_ = a.State.SetRepoPending(repo.Path, repo.ID, false)
+	if err := fs.renameVerifiedCheckout(repo, tombstone); err != nil {
 		return fmt.Errorf("remove repo %s: %w", repo.Path, err)
 	}
 	return nil
@@ -578,16 +627,11 @@ func (a *App) removeActiveRepo(fs *repoFS, repo ManagedRepo, tombstone string) e
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect pending removal %s: %w", tombstone, err)
 	}
-	if _, err := fs.lstat(purgeMarkerPath(tombstone)); err == nil {
-		if !fs.purgeMarkerMatches(tombstone, repo) {
-			a.Log.Warn("keeping repo %s: pending-removal marker %s belongs to another record", dir, purgeMarkerPath(tombstone))
-			return nil
-		}
-		if err := fs.remove(purgeMarkerPath(tombstone)); err != nil {
-			return fmt.Errorf("clear pending-removal marker %s: %w", purgeMarkerPath(tombstone), err)
-		}
-	} else if !os.IsNotExist(err) {
+	if _, owner, err := fs.inspectPurgeMarker(tombstone, repo); err != nil {
 		return fmt.Errorf("inspect pending-removal marker %s: %w", purgeMarkerPath(tombstone), err)
+	} else if owner == repoOwnerDifferent {
+		a.Log.Warn("keeping repo %s: pending-removal marker %s belongs to another record", dir, purgeMarkerPath(tombstone))
+		return nil
 	}
 	a.Log.Info("removing aiv-cloned repo %s", dir)
 	if err := a.beginPendingRemoval(fs, repo, tombstone, false); err != nil {
@@ -603,7 +647,11 @@ func (a *App) removeActiveRepo(fs *repoFS, repo ManagedRepo, tombstone string) e
 func (a *App) finishPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone string) error {
 	dir := repo.Path
 	if _, err := fs.lstat(tombstone); err == nil {
-		if !fs.purgeMarkerOwnsTombstone(tombstone, repo) {
+		owned, err := fs.purgeMarkerOwnsTombstone(tombstone, repo)
+		if err != nil {
+			return fmt.Errorf("verify pending directory %s: %w", tombstone, err)
+		}
+		if !owned {
 			a.Log.Warn("keeping repo %s: pending removal %s is not the renamed checkout", dir, tombstone)
 			return nil
 		}
@@ -629,15 +677,22 @@ func (a *App) finishPendingRemoval(fs *repoFS, repo ManagedRepo, tombstone strin
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("inspect repo %s: %w", dir, err)
 	}
-	_ = fs.remove(purgeMarkerPath(tombstone))
-	if err := a.State.ForgetManagedRepoID(dir, repo.ID); err != nil {
-		return fmt.Errorf("forget removed repo %s: %w", dir, err)
-	}
-	return nil
+	return a.retirePendingRemoval(fs, repo, tombstone)
 }
 
 func (a *App) retirePendingRemoval(fs *repoFS, repo ManagedRepo, tombstone string) error {
-	_ = fs.remove(purgeMarkerPath(tombstone))
+	_, owner, err := fs.inspectPurgeMarker(tombstone, repo)
+	if err != nil {
+		return fmt.Errorf("verify removal marker %s: %w", purgeMarkerPath(tombstone), err)
+	}
+	if owner == repoOwnerDifferent {
+		return fmt.Errorf("conflicting removal marker %s", purgeMarkerPath(tombstone))
+	}
+	if owner == repoOwnerMatches {
+		if err := fs.remove(purgeMarkerPath(tombstone)); err != nil {
+			return fmt.Errorf("clear removal marker %s: %w", purgeMarkerPath(tombstone), err)
+		}
+	}
 	if err := a.State.ForgetManagedRepoID(repo.Path, repo.ID); err != nil {
 		return fmt.Errorf("retire pending removal %s: %w", repo.Path, err)
 	}
@@ -645,14 +700,13 @@ func (a *App) retirePendingRemoval(fs *repoFS, repo ManagedRepo, tombstone strin
 }
 
 func (a *App) deleteTombstone(fs *repoFS, repo ManagedRepo, tombstone string) error {
-	if err := fs.removeAll(tombstone); err != nil {
+	if err := a.verifyNestedCheckouts(fs, repo.Path, tombstone); err != nil {
+		return err
+	}
+	if err := fs.removeVerifiedTombstone(tombstone, repo); err != nil {
 		return fmt.Errorf("remove repo %s: %w", repo.Path, err)
 	}
-	_ = fs.remove(purgeMarkerPath(tombstone))
-	if err := a.State.ForgetManagedRepoID(repo.Path, repo.ID); err != nil {
-		return fmt.Errorf("forget removed repo %s: %w", repo.Path, err)
-	}
-	return nil
+	return a.retirePendingRemoval(fs, repo, tombstone)
 }
 
 // Redeploy is destroy (non-purge) followed by a full cast.

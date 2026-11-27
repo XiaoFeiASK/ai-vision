@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/antgroup/ai-vision/aivision-cli/internal/pathguard"
@@ -68,13 +70,36 @@ func (f *repoFS) readFile(path string) ([]byte, error) {
 	return f.root.ReadFile(rel)
 }
 
-func (f *repoFS) rename(oldPath, newPath string) error {
-	oldRel, err := f.rel(oldPath)
+func (f *repoFS) renameVerifiedCheckout(repo ManagedRepo, tombstone string) error {
+	oldRel, err := f.rel(repo.Path)
 	if err != nil {
 		return err
 	}
-	newRel, err := f.rel(newPath)
+	newRel, err := f.rel(tombstone)
 	if err != nil {
+		return err
+	}
+	marker, owner, err := f.inspectPurgeMarker(tombstone, repo)
+	if err != nil {
+		return err
+	}
+	if owner != repoOwnerMatches {
+		return fmt.Errorf("removal marker no longer verifies %s", repo.Path)
+	}
+	info, err := f.root.Lstat(oldRel)
+	if err != nil {
+		return err
+	}
+	matches, err := marker.ownsDirectory(info)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return fmt.Errorf("checkout %s no longer matches its recorded identity", repo.Path)
+	}
+	if _, err := f.root.Lstat(newRel); err == nil {
+		return fmt.Errorf("removal path %s already exists", tombstone)
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 	return f.root.Rename(oldRel, newRel)
@@ -91,28 +116,50 @@ func (f *repoFS) remove(path string) error {
 	return nil
 }
 
-func (f *repoFS) removeAll(path string) error {
+func (f *repoFS) openDirectory(path string) (*os.Root, os.FileInfo, error) {
 	rel, err := f.rel(path)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	return f.root.RemoveAll(rel)
+	before, err := f.root.Lstat(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !before.IsDir() {
+		return nil, nil, fmt.Errorf("%s: %w", path, syscall.ENOTDIR)
+	}
+	dir, err := f.root.OpenRoot(rel)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := dir.Stat(".")
+	if err != nil {
+		_ = dir.Close()
+		return nil, nil, err
+	}
+	if !os.SameFile(before, info) {
+		_ = dir.Close()
+		return nil, nil, fmt.Errorf("directory %s changed while opening it", path)
+	}
+	return dir, info, nil
+}
+
+func (f *repoFS) checkoutOwner(path string) (repoOwner, error) {
+	dir, info, err := f.openDirectory(path)
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return repoOwner{}, nil
+	}
+	if err != nil {
+		return repoOwner{}, err
+	}
+	defer dir.Close()
+	return readCheckoutOwner(dir, path, info)
 }
 
 func (f *repoFS) inspectRepoOwner(dir, want string) (repoOwnerState, error) {
-	b, err := f.readFile(filepath.Join(dir, repoOwnerMarker))
+	owner, err := f.checkoutOwner(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return repoOwnerMissing, nil
-		}
 		return repoOwnerMissing, err
-	}
-	var owner repoOwner
-	if err := json.Unmarshal(b, &owner); err != nil {
-		return repoOwnerMissing, fmt.Errorf("parse %s: %w", filepath.Join(dir, repoOwnerMarker), err)
-	}
-	if owner.ID == "" {
-		return repoOwnerMissing, fmt.Errorf("%s has no ownership id", filepath.Join(dir, repoOwnerMarker))
 	}
 	if owner.ID != want {
 		return repoOwnerDifferent, nil
@@ -121,11 +168,32 @@ func (f *repoFS) inspectRepoOwner(dir, want string) (repoOwnerState, error) {
 }
 
 func (f *repoFS) writePurgeMarker(tombstone string, repo ManagedRepo) error {
-	marker := purgeMarkerRecord{Path: repo.Path, ID: repo.ID}
-	if dev, ino, ok := f.identity(repo.Path); ok {
-		marker.HasIdentity = true
-		marker.Dev = dev
-		marker.Ino = ino
+	dir, info, err := f.openDirectory(repo.Path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	checkout, err := readCheckoutOwner(dir, repo.Path, info)
+	if err != nil {
+		return err
+	}
+	if checkout.ID != repo.ID {
+		return fmt.Errorf("checkout ownership changed for %s", repo.Path)
+	}
+	dev, ino, ok := fileIdentity(info)
+	if !ok {
+		return fmt.Errorf("directory identity is unavailable for %s", repo.Path)
+	}
+	marker := purgeMarkerRecord{Path: repo.Path, ID: repo.ID, HasIdentity: true, Dev: dev, Ino: ino}
+	existing, owner, err := f.inspectPurgeMarker(tombstone, repo)
+	if err != nil {
+		return err
+	}
+	if owner != repoOwnerMissing {
+		if owner == repoOwnerMatches && existing == marker {
+			return nil
+		}
+		return fmt.Errorf("conflicting removal marker %s", purgeMarkerPath(tombstone))
 	}
 	b, err := json.Marshal(marker)
 	if err != nil {
@@ -166,7 +234,8 @@ func (f *repoFS) writePurgeMarker(tombstone string, repo ManagedRepo) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := f.root.Rename(tmpRel, rel); err != nil {
+	// Publish the complete marker without replacing any file at the destination.
+	if err := f.root.Link(tmpRel, rel); err != nil {
 		return err
 	}
 	if d, err := f.root.Open(dirRel); err == nil {
@@ -176,38 +245,100 @@ func (f *repoFS) writePurgeMarker(tombstone string, repo ManagedRepo) error {
 	return nil
 }
 
-func (f *repoFS) readPurgeMarker(tombstone string) (purgeMarkerRecord, error) {
-	b, err := f.readFile(purgeMarkerPath(tombstone))
+func (f *repoFS) inspectPurgeMarker(tombstone string, repo ManagedRepo) (purgeMarkerRecord, repoOwnerState, error) {
+	path := purgeMarkerPath(tombstone)
+	info, err := f.lstat(path)
+	if os.IsNotExist(err) {
+		return purgeMarkerRecord{}, repoOwnerMissing, nil
+	}
 	if err != nil {
-		return purgeMarkerRecord{}, err
+		return purgeMarkerRecord{}, repoOwnerMissing, err
+	}
+	if !info.Mode().IsRegular() {
+		return purgeMarkerRecord{}, repoOwnerMissing, fmt.Errorf("removal marker %s is not a regular file", path)
+	}
+	b, err := f.readFile(path)
+	if err != nil {
+		return purgeMarkerRecord{}, repoOwnerMissing, err
 	}
 	var marker purgeMarkerRecord
 	if err := json.Unmarshal(b, &marker); err != nil {
-		return purgeMarkerRecord{}, err
+		return purgeMarkerRecord{}, repoOwnerMissing, fmt.Errorf("parse removal marker %s: %w", path, err)
 	}
-	return marker, nil
-}
-
-func (f *repoFS) purgeMarkerMatches(tombstone string, repo ManagedRepo) bool {
-	marker, err := f.readPurgeMarker(tombstone)
-	return err == nil && marker.Path == repo.Path && marker.ID == repo.ID
+	if marker.Path == "" || marker.ID == "" {
+		return purgeMarkerRecord{}, repoOwnerMissing, fmt.Errorf("removal marker %s has no checkout path or ownership id", path)
+	}
+	if marker.Path != repo.Path || marker.ID != repo.ID {
+		return marker, repoOwnerDifferent, nil
+	}
+	if !marker.HasIdentity {
+		return marker, repoOwnerMatches, fmt.Errorf("removal marker %s has no directory identity", path)
+	}
+	return marker, repoOwnerMatches, nil
 }
 
 // purgeMarkerOwnsTombstone verifies that the directory at the tombstone path
 // is the object that was renamed, not merely that a removal was once planned.
-func (f *repoFS) purgeMarkerOwnsTombstone(tombstone string, repo ManagedRepo) bool {
-	marker, err := f.readPurgeMarker(tombstone)
-	if err != nil || marker.Path != repo.Path || marker.ID != repo.ID {
-		return false
+func (f *repoFS) purgeMarkerOwnsTombstone(tombstone string, repo ManagedRepo) (bool, error) {
+	marker, owner, err := f.inspectPurgeMarker(tombstone, repo)
+	if err != nil || owner != repoOwnerMatches {
+		return false, err
 	}
-	if marker.HasIdentity {
-		dev, ino, ok := f.identity(tombstone)
-		return ok && dev == marker.Dev && ino == marker.Ino
+	info, err := f.lstat(tombstone)
+	if err != nil {
+		return false, err
 	}
-	// Without a persisted identity, only trust the tombstone when the checkout
-	// is no longer at its original path, so the rename must have happened.
-	if _, err := f.lstat(repo.Path); err == nil || !os.IsNotExist(err) {
-		return false
+	return marker.ownsDirectory(info)
+}
+
+func (marker purgeMarkerRecord) ownsDirectory(info os.FileInfo) (bool, error) {
+	if !info.IsDir() {
+		return false, nil
 	}
-	return true
+	dev, ino, ok := fileIdentity(info)
+	if !marker.HasIdentity || !ok {
+		return false, fmt.Errorf("directory identity is unavailable for %s", info.Name())
+	}
+	return dev == marker.Dev && ino == marker.Ino, nil
+}
+
+func (f *repoFS) removeVerifiedTombstone(tombstone string, repo ManagedRepo) error {
+	marker, owner, err := f.inspectPurgeMarker(tombstone, repo)
+	if err != nil {
+		return err
+	}
+	if owner != repoOwnerMatches {
+		return fmt.Errorf("removal marker no longer verifies %s", tombstone)
+	}
+	dir, info, err := f.openDirectory(tombstone)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	matches, err := marker.ownsDirectory(info)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return fmt.Errorf("pending directory %s no longer matches its recorded identity", tombstone)
+	}
+	entries, err := fs.ReadDir(dir.FS(), ".")
+	if err != nil {
+		return err
+	}
+	// Recursion stays on the verified directory handle. Only the final removal
+	// of the empty directory uses its name.
+	for _, entry := range entries {
+		if err := dir.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	current, err := f.lstat(tombstone)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, current) {
+		return fmt.Errorf("pending directory %s changed during removal", tombstone)
+	}
+	return f.remove(tombstone)
 }

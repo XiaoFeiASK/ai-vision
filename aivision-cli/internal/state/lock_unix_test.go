@@ -21,7 +21,7 @@ func TestFlockBlocksIndependentRecordStore(t *testing.T) {
 	}
 	defer second.Close()
 	lockPath := s.lockFile()
-	rel, err := first.workRel(lockPath)
+	rel, err := first.rel(lockPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestFlockBlocksIndependentRecordStore(t *testing.T) {
 	acquired := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		rel, err := second.workRel(lockPath)
+		rel, err := second.rel(lockPath)
 		if err != nil {
 			errCh <- err
 			return

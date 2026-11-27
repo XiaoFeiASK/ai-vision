@@ -51,6 +51,45 @@ func EnsureStrictlyWithin(root, target string) error {
 	return ensure(root, target, false)
 }
 
+// Contains reports whether deleting the existing directory root would also
+// remove target. Directory identity handles aliases on case-insensitive volumes.
+func Contains(root, target string) (bool, error) {
+	_, inside, err := RelativeWithin(root, target)
+	return inside, err
+}
+
+// RelativeWithin returns the relative path below an existing root, resolving
+// symlinks and comparing filesystem identities for case-insensitive aliases.
+func RelativeWithin(root, target string) (string, bool, error) {
+	rootInfo, err := os.Stat(root)
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	path, err := Resolve(target)
+	if err != nil {
+		return "", false, err
+	}
+	resolved := path
+	for {
+		info, err := os.Stat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return "", false, err
+		}
+		if err == nil && os.SameFile(rootInfo, info) {
+			rel, err := filepath.Rel(path, resolved)
+			return rel, true, err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", false, nil
+		}
+		path = parent
+	}
+}
+
 func ensure(root, target string, allowRoot bool) error {
 	resolvedRoot, err := Resolve(root)
 	if err != nil {

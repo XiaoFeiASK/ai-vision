@@ -57,6 +57,59 @@ func TestRemoveAllDeletesNamespaceRoot(t *testing.T) {
 	}
 }
 
+func TestRemoveAllRequiresNamespaceDirectory(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "staging")
+	if err := os.WriteFile(s.Root, []byte("ordinary file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.VerifyPurgeTarget(); err == nil {
+		t.Fatal("a regular file was accepted as a namespace state directory")
+	}
+	if err := s.RemoveAll(); err == nil {
+		t.Fatal("RemoveAll accepted a regular file as deployment state")
+	}
+	data, err := os.ReadFile(s.Root)
+	if err != nil || string(data) != "ordinary file" {
+		t.Fatalf("the file at the selected namespace changed: %q, %v", data, err)
+	}
+}
+
+func TestRemoveAllKeepsDifferentlyCasedNamespace(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "Staging")
+	if err := s.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	alias := NewState(workdir, "staging")
+	_, err := os.Stat(alias.Root)
+	switch {
+	case os.IsNotExist(err):
+		// The filesystem supports two deployments with these names.
+		if err := alias.EnsureDirs(); err != nil {
+			t.Fatal(err)
+		}
+		if err := alias.RemoveAll(); err != nil {
+			t.Fatal(err)
+		}
+	case err != nil:
+		t.Fatal(err)
+	default:
+		if err := alias.VerifyPurgeTarget(); err == nil {
+			t.Fatal("purge accepted a different spelling of an existing namespace")
+		}
+		if err := alias.RemoveAll(); err == nil {
+			t.Fatal("RemoveAll accepted a different spelling of an existing namespace")
+		}
+	}
+	if _, err := os.Stat(s.StateDir); err != nil {
+		t.Fatalf("the original namespace state was lost: %v", err)
+	}
+	if err := s.RemoveAll(); err != nil {
+		t.Fatalf("purge with the exact mixed-case namespace failed: %v", err)
+	}
+}
+
 func TestManagedReposRoundTrip(t *testing.T) {
 	s := NewState(t.TempDir(), "aivision")
 	repos, err := s.ManagedRepos()
@@ -296,12 +349,8 @@ func TestManagedReposSurviveStatePurge(t *testing.T) {
 	if err != nil || len(repos) != 0 {
 		t.Fatalf("records after forget = %v, %v", repos, err)
 	}
-	entries, err := os.ReadDir(s.recordDir())
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("records remain after forget: %v", entries)
+	if _, err := os.Stat(s.reposFile()); !os.IsNotExist(err) {
+		t.Fatalf("record file remains after forget: %v", err)
 	}
 }
 
@@ -331,9 +380,14 @@ func TestManagedReposReadsLegacyRecord(t *testing.T) {
 	}
 }
 
-func TestManagedReposReadsNamedRecord(t *testing.T) {
+func TestManagedReposLeavesPreviewRecordsUntouched(t *testing.T) {
 	workdir := t.TempDir()
 	s := NewState(workdir, "aivision")
+	neighbor := NewState(workdir, "neighbor")
+	neighborRepo := filepath.Join(t.TempDir(), "repo")
+	if err := neighbor.RecordManagedRepo(neighborRepo, "neighbor-id"); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(s.recordDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -342,24 +396,29 @@ func TestManagedReposReadsNamedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.namedReposFile(), named, 0o600); err != nil {
+	preview := filepath.Join(s.recordDir(), "aivision.json")
+	if err := os.WriteFile(preview, named, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	repos, err := s.ManagedRepos()
-	if err != nil || len(repos) != 1 || repos[0].ID != "old-id" {
-		t.Fatalf("named records = %v, %v", repos, err)
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("ambiguous PR preview records loaded: %v, %v", repos, err)
 	}
 
 	other := filepath.Join(t.TempDir(), "other")
 	if err := s.RecordManagedRepo(other, "new-id"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(s.namedReposFile()); !os.IsNotExist(err) {
-		t.Fatalf("named record file was not migrated: %v", err)
+	if data, err := os.ReadFile(preview); err != nil || string(data) != string(named) {
+		t.Fatalf("PR preview records changed: %q, %v", data, err)
 	}
 	repos, err = s.ManagedRepos()
-	if err != nil || len(repos) != 2 {
-		t.Fatalf("records after migration = %v, %v", repos, err)
+	if err != nil || len(repos) != 1 || repos[0].Path != other {
+		t.Fatalf("records after registration = %v, %v", repos, err)
+	}
+	repos, err = neighbor.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != neighborRepo {
+		t.Fatalf("neighbor's records after registration = %v, %v", repos, err)
 	}
 }
 
@@ -435,9 +494,17 @@ func TestRecordTargetsRejectSymlinkedStorageWithoutWriting(t *testing.T) {
 	}
 }
 
-func TestRecordStoreStaysBoundToOpenedRecordDirectory(t *testing.T) {
+func TestRecordStoreRejectsReplacedRecordDirectory(t *testing.T) {
 	workdir := t.TempDir()
 	s := NewState(workdir, "aivision")
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := s.RecordManagedRepo(repo, "enrolled"); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(s.reposFile())
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := s.openRecordStore(true)
 	if err != nil {
 		t.Fatal(err)
@@ -448,18 +515,45 @@ func TestRecordStoreStaysBoundToOpenedRecordDirectory(t *testing.T) {
 	if err := os.Rename(s.recordDir(), moved); err != nil {
 		t.Fatal(err)
 	}
-	elsewhere := t.TempDir()
-	if err := os.Symlink(elsewhere, s.recordDir()); err != nil {
-		t.Skipf("symlinks unavailable: %v", err)
-	}
-	if err := store.writeFileAtomic(s.reposFile(), []byte("[]"), 0o644); err != nil {
+	if err := os.Mkdir(s.recordDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(moved, filepath.Base(s.reposFile()))); err != nil {
-		t.Fatalf("record was not written through the opened directory: %v", err)
+	if err := store.writeFileAtomic(s.reposFile(), []byte("[]"), 0o644); err == nil {
+		t.Fatal("record update proceeded after the verified directory was replaced")
 	}
-	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
-		t.Fatalf("record escaped through the replaced path: %v, %v", entries, err)
+	if data, err := os.ReadFile(filepath.Join(moved, filepath.Base(s.reposFile()))); err != nil || string(data) != string(want) {
+		t.Fatalf("original record changed after store replacement: %q, %v", data, err)
+	}
+	if entries, err := os.ReadDir(s.recordDir()); err != nil || len(entries) != 0 {
+		t.Fatalf("replacement record directory changed: %v, %v", entries, err)
+	}
+}
+
+func TestRecordStoreRejectsReplacedLegacyStateDirectory(t *testing.T) {
+	s := NewState(t.TempDir(), "aivision")
+	if err := s.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.legacyReposFile(), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := s.openRecordStore(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	moved := s.StateDir + "-moved"
+	if err := os.Rename(s.StateDir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.StateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.managedReposFrom(store); err == nil {
+		t.Fatal("ownership read proceeded after the verified legacy state directory was replaced")
+	}
+	if _, err := os.Stat(filepath.Join(moved, filepath.Base(s.legacyReposFile()))); err != nil {
+		t.Fatalf("the legacy record was modified: %v", err)
 	}
 }
 

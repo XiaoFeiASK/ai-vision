@@ -3,9 +3,12 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -305,6 +308,79 @@ func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
 	}
 }
 
+func TestDestroyPurgeReposRetriesAfterUnreadableRemovalMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based marker read failure does not apply to root")
+	}
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	repo := ManagedRepo{Path: cloned, ID: "owner-id"}
+	tombstone := app.purgeTombstone(repo)
+	writeTestPurgeMarker(t, sourceRoot, tombstone, repo)
+	if err := os.Rename(cloned, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	marker := purgeMarkerPath(tombstone)
+	if err := os.Chmod(marker, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(marker, 0o600) })
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("destroy did not return the marker read error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tombstone, "file")); err != nil {
+		t.Fatalf("checkout did not survive the failed retry: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 1 || !repos[0].Pending {
+		t.Fatalf("pending record was not preserved: %v, %v", repos, err)
+	}
+	if err := os.Chmod(marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatalf("retry after restoring marker access: %v", err)
+	}
+	for _, path := range []string{tombstone, marker} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s survived the retry: %v", path, err)
+		}
+	}
+	repos, err = app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("record survived the retry: %v, %v", repos, err)
+	}
+}
+
+func TestPurgePreviewRefusesIncompletePendingIdentity(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot)
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := os.Rename(cloned, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := json.Marshal(purgeMarkerRecord{Path: cloned, ID: "owner-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(purgeMarkerPath(tombstone), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if preview, err := app.PurgeRepoPreview(); err == nil || len(preview) != 0 {
+		t.Fatalf("preview authorized a pending removal without directory identity: %v, %v", preview, err)
+	}
+}
+
 func TestDestroyPurgeReposIgnoresMaliciousOwnerID(t *testing.T) {
 	sourceRoot := t.TempDir()
 	victim := filepath.Join(sourceRoot, "victim")
@@ -527,29 +603,21 @@ func TestDestroySubprocessHelper(t *testing.T) {
 	if err := fs.writePurgeMarker(tombstone, repo); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.rename(repo.Path, tombstone); err != nil {
+	if err := fs.renameVerifiedCheckout(repo, tombstone); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(os.Getenv("AIV_HELPER_READY"), []byte("ready"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(os.Getenv("AIV_HELPER_RELEASE")); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the parent to release the helper")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	// Leave the pending record and tombstone behind, as an interrupted
-	// invocation would.
-	release()
-	os.Exit(0)
+	// The parent kills this process before deferred cleanup can release the lock.
+	time.Sleep(10 * time.Second)
+	t.Fatal("parent did not terminate the lock holder")
 }
 
 func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("deployment crash recovery runs on Linux and macOS")
+	}
 	workdir := t.TempDir()
 	sourceRoot := t.TempDir()
 	cloned := filepath.Join(sourceRoot, "cloned")
@@ -559,7 +627,6 @@ func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
 
 	signals := t.TempDir()
 	ready := filepath.Join(signals, "ready")
-	releasePath := filepath.Join(signals, "release")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDestroySubprocessHelper$")
 	cmd.Env = append(os.Environ(),
 		"AIV_DESTROY_HELPER=1",
@@ -567,7 +634,6 @@ func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
 		"AIV_HELPER_SOURCE="+sourceRoot,
 		"AIV_HELPER_CLONE="+cloned,
 		"AIV_HELPER_READY="+ready,
-		"AIV_HELPER_RELEASE="+releasePath,
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -578,7 +644,7 @@ func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
 	defer func() {
 		if !waited {
 			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
+			_ = cmd.Wait()
 		}
 	}()
 	deadline := time.Now().Add(10 * time.Second)
@@ -588,7 +654,7 @@ func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
+			_ = cmd.Wait()
 			waited = true
 			t.Fatalf("helper did not reach the interrupted state: %s", stderr.String())
 		}
@@ -602,14 +668,15 @@ func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
 		t.Fatalf("destroy finished while another process held the removal lock: %v", err)
 	case <-time.After(250 * time.Millisecond):
 	}
-	if err := os.WriteFile(releasePath, []byte("go"), 0o600); err != nil {
+	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Wait(); err != nil {
-		waited = true
-		t.Fatalf("helper failed: %v\n%s", err, stderr.String())
-	}
+	err := cmd.Wait()
 	waited = true
+	var interrupted *exec.ExitError
+	if !errors.As(err, &interrupted) || interrupted.ExitCode() != -1 {
+		t.Fatalf("lock holder did not exit by signal: %v\n%s", err, stderr.String())
+	}
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -651,8 +718,9 @@ func TestRepoFSRefusesSwappedSymlink(t *testing.T) {
 	if err := os.Symlink(victim, child); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if err := fs.removeAll(child); err == nil {
-		t.Fatal("removal followed a symlink outside the source root")
+	if dir, _, err := fs.openDirectory(child); err == nil {
+		_ = dir.Close()
+		t.Fatal("directory access followed a symlink outside the source root")
 	}
 	if _, err := os.Stat(filepath.Join(victim, "keep")); err != nil {
 		t.Fatalf("directory outside the source root was removed: %v", err)

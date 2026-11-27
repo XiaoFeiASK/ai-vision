@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/antgroup/ai-vision/aivision-cli/internal/deploy/runtime"
 )
@@ -111,24 +114,10 @@ func TestDestroyConfirmationMatchesTarget(t *testing.T) {
 
 func TestDestroyPromptListsRecordedRepos(t *testing.T) {
 	dir := t.TempDir()
-	repo := filepath.Join(dir, "src", "backend")
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repo, ".git", "aivision-clone.json"), []byte(`{"id":"id"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.NewState(dir, "repo-prompt").RecordManagedRepo(repo, "id"); err != nil {
-		t.Fatal(err)
-	}
-	stale := filepath.Join(dir, "src", "stale")
-	if err := os.MkdirAll(filepath.Join(stale, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(stale, ".git", "aivision-clone.json"), []byte(`{"id":"different"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := runtime.NewState(dir, "repo-prompt").RecordManagedRepo(stale, "id"); err != nil {
+	src := filepath.Join(dir, "src")
+	repo := forgeTestCheckout(t, dir, src, "repo-prompt", "backend")
+	stale := forgeTestCheckout(t, dir, src, "repo-prompt", "stale")
+	if err := runtime.NewState(dir, "repo-prompt").RecordManagedRepo(stale, "different-id"); err != nil {
 		t.Fatal(err)
 	}
 	out, err := captureCLIStderr(t, "n\n", func() error {
@@ -151,30 +140,47 @@ func TestDestroyPromptListsRecordedRepos(t *testing.T) {
 	}
 }
 
+// Exercise the same Git clone, ownership marker and record registration as a
+// source deployment. The origin is local so the test also runs offline.
+func forgeTestCheckout(t *testing.T, work, sourceRoot, namespace, name string) string {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_TEMPLATE_DIR", t.TempDir())
+	origin := t.TempDir()
+	for _, args := range [][]string{
+		{"-c", "init.defaultBranch=main", "init", "--quiet", origin},
+		{"-C", origin, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+			"-c", "commit.gpgsign=false", "commit", "--quiet", "--allow-empty", "-m", "fixture"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("prepare local origin: %v\n%s", err, out)
+		}
+	}
+	config := fmt.Sprintf(`metadata: {name: fixture, namespace: %q}
+config: {workdir: %q, sourceRoot: %q}
+components:
+  - {name: app, kind: process, run: "true", repo: {path: %q, url: %q, branch: main}}
+`, namespace, work, sourceRoot, name, origin)
+	bp := filepath.Join(t.TempDir(), "forge.yaml")
+	if err := os.WriteFile(bp, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSimple("forge", []string{"--file", bp}, (*runtime.App).Forge); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(sourceRoot, name)
+}
+
 func TestDestroyPurgeReposThroughCLI(t *testing.T) {
 	dir := t.TempDir()
 	sourceRoot := filepath.Join(dir, "src")
-	cloned := filepath.Join(sourceRoot, "cloned")
+	cloned := forgeTestCheckout(t, dir, sourceRoot, "aivision", "cloned")
 	existing := filepath.Join(sourceRoot, "existing")
-	for _, checkout := range []struct{ dir, id string }{
-		{dir: cloned, id: "owner-id"},
-		{dir: existing, id: ""},
-	} {
-		if err := os.MkdirAll(filepath.Join(checkout.dir, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(checkout.dir, "file"), []byte("keep"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if checkout.id != "" {
-			marker := []byte(`{"id":"` + checkout.id + `"}`)
-			if err := os.WriteFile(filepath.Join(checkout.dir, ".git", "aivision-clone.json"), marker, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := runtime.NewState(dir, "aivision").RecordManagedRepo(checkout.dir, checkout.id); err != nil {
-				t.Fatal(err)
-			}
-		}
+	if err := os.MkdirAll(filepath.Join(existing, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(existing, "file"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	bpPath := filepath.Join(dir, "blueprint.yaml")
 	content := fmt.Sprintf(`metadata: {name: cli-destroy, namespace: aivision}
@@ -197,6 +203,156 @@ components:
 	}
 	if _, err := os.Stat(filepath.Join(existing, "file")); err != nil {
 		t.Fatalf("pre-existing checkout was removed: %v", err)
+	}
+}
+
+func TestDestroyRejectsSourceInsideStateBeforeTeardown(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		sourceRoot string
+		repoPath   string
+		flag       string
+		yes        bool
+	}{
+		{"source-root", "demo/sources", "checkout", "--purge", true},
+		{"source-root-is-state", "demo", "checkout", "--purge-repos", true},
+		{"checkout", ".", "demo/checkout", "--purge", true},
+		{"interactive", "demo/sources", "checkout", "--purge-repos", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			sourceRoot := filepath.Join(work, tc.sourceRoot)
+			if err := os.MkdirAll(filepath.Join(sourceRoot, tc.repoPath, ".git"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			teardown := filepath.Join(work, "teardown-ran")
+			config := fmt.Sprintf(`metadata: {name: layout, namespace: demo}
+config: {workdir: %q, sourceRoot: %q}
+components:
+  - name: app
+    kind: process
+    run: "true"
+    repo: {path: %q}
+    teardown:
+      - shell: "touch %s"
+`, work, sourceRoot, tc.repoPath, teardown)
+			bp := filepath.Join(work, "blueprint.yaml")
+			if err := os.WriteFile(bp, []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"--file", bp, tc.flag}
+			if tc.yes {
+				args = append(args, "-y")
+			}
+			output, err := captureCLIStderr(t, "n\n", func() error { return cmdDestroy(args) })
+			if err == nil || !strings.Contains(err.Error(), "state directory") {
+				t.Fatalf("overlapping purge should identify the state directory, got %v", err)
+			}
+			if strings.Contains(output, "Continue?") {
+				t.Fatal("asked for confirmation of an unsafe layout")
+			}
+			if _, err := os.Stat(teardown); !os.IsNotExist(err) {
+				t.Fatalf("unexpected teardown marker: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(sourceRoot, tc.repoPath, ".git")); err != nil {
+				t.Fatalf("existing checkout was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+func TestDestroyKeepsCheckoutRegisteredAfterEmptyConfirmation(t *testing.T) {
+	dir := t.TempDir()
+	sourceRoot := filepath.Join(dir, "src")
+	state := runtime.NewState(dir, "aivision")
+	bpPath := filepath.Join(dir, "blueprint.yaml")
+	content := fmt.Sprintf(`metadata: {name: cli-destroy, namespace: aivision}
+config:
+  workdir: %s
+  sourceRoot: %s
+components:
+  - {name: demo, kind: process, run: "true", repo: {path: demo}}
+`, dir, sourceRoot)
+	if err := os.WriteFile(bpPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	in, answer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer answer.Close()
+	out, prompt, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	defer prompt.Close()
+	if err := out.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	oldIn, oldErr := os.Stdin, os.Stderr
+	os.Stdin, os.Stderr = in, prompt
+	done := make(chan struct{})
+	var destroyErr error
+	go func() {
+		defer close(done)
+		defer prompt.Close()
+		destroyErr = cmdDestroy([]string{"--file", bpPath, "--purge-repos"})
+	}()
+	defer func() {
+		_ = answer.Close()
+		<-done
+		os.Stdin, os.Stderr = oldIn, oldErr
+	}()
+	preview, err := bufio.NewReader(out).ReadString(']')
+	if err != nil || !strings.Contains(preview, "no verified aiv-cloned checkouts to delete") {
+		t.Fatalf("expected an empty confirmation, got %q: %v", preview, err)
+	}
+
+	checkout := forgeTestCheckout(t, dir, sourceRoot, "aivision", "demo")
+	if _, err := io.WriteString(answer, "y\n"); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if destroyErr != nil {
+		t.Fatal(destroyErr)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".git")); err != nil {
+		t.Fatalf("checkout registered after the prompt was not preserved: %v", err)
+	}
+	repos, err := state.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != checkout || repos[0].ID == "" {
+		t.Fatalf("new checkout record = %v, %v", repos, err)
+	}
+}
+
+func TestDestroyRetainsWorkdirInsideManagedCheckout(t *testing.T) {
+	src := t.TempDir()
+	work := filepath.Join(src, "app", "work")
+	checkout := forgeTestCheckout(t, work, src, "dev", "app")
+	state := runtime.NewState(work, "dev")
+	if err := state.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`metadata: {name: layout, namespace: dev}
+config: {workdir: %q, sourceRoot: %q}
+components:
+  - {name: app, kind: process, run: "true", repo: {path: app}}
+`, work, src)
+	bp := filepath.Join(t.TempDir(), "blueprint.yaml")
+	if err := os.WriteFile(bp, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdDestroy([]string{"--file", bp, "--purge-repos", "-y"}); err == nil ||
+		!strings.Contains(err.Error(), "contains the deployment state directory") {
+		t.Fatalf("expected a workdir overlap error, got %v", err)
+	}
+	repos, err := state.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != checkout || repos[0].Pending {
+		t.Fatalf("checkout and registry should remain usable: %v, %v", repos, err)
 	}
 }
 

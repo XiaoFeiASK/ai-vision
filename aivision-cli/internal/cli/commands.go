@@ -500,6 +500,9 @@ func cmdDestroy(args []string) error {
 	if !*yes {
 		warn := "This stops all AI Vision components in namespace '" + app.BP.Metadata.Namespace + "'."
 		if opts.Purge && !useCompose {
+			if err := app.VerifyStatePurge(); err != nil {
+				return err
+			}
 			warn += "\n  State directory to delete: " + app.State.Root
 		}
 		if useCompose && opts.Purge {

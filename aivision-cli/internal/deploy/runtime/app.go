@@ -285,7 +285,9 @@ func (a *App) gitCloneOrFetch(c Component) error {
 		return nil
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		a.recoverRepoRecord(dir)
+		if err := a.recoverRepoRecord(dir); err != nil {
+			return err
+		}
 		if !a.Force {
 			a.Log.Info("reuse existing repo %s (use --force to fetch %s)", dir, branch)
 			return nil
@@ -332,23 +334,23 @@ git fetch --prune origin && git checkout %s && git reset --hard origin/%s`,
 
 // recoverRepoRecord repairs a clone whose record write failed after the
 // ownership marker was written. Checkouts without aiv's marker are ignored.
-func (a *App) recoverRepoRecord(dir string) {
+func (a *App) recoverRepoRecord(dir string) error {
 	if a.State == nil || a.SourceRoot() == "" {
-		return
+		return nil
 	}
-	owner, err := readRepoOwner(dir)
+	fs, err := openRepoFS(a.SourceRoot())
 	if err != nil {
-		return
+		return nil
 	}
-	if owner.Scope == "" || owner.Scope != a.repoOwnerScope() {
-		return
-	}
-	if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
-		return
+	defer fs.Close()
+	owner, err := fs.checkoutOwner(dir)
+	if err != nil || owner.Scope == "" || owner.Scope != a.repoOwnerScope() {
+		return nil
 	}
 	if err := a.State.RecordManagedRepo(dir, owner.ID); err != nil {
-		a.Log.Warn("recover ownership record for %s: %v", dir, err)
+		return fmt.Errorf("recover ownership record for %s: %w", dir, err)
 	}
+	return nil
 }
 
 func (a *App) repoOwnerScope() string {

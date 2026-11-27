@@ -285,8 +285,12 @@ parameterized templates; regenerate resolved exports from original private vars.
 It does not automatically import standalone configuration into CLI vars or adopt
 foreign default Docker resources.
 
-Default Docker `destroy --purge` keeps its existing removal of managed datastore
-volumes and namespace state, including the default metastore. Compose
+Docker `destroy --purge` tears down the components, removes their configured
+named volumes, then purges namespace state, including the default metastore.
+If Docker cannot remove a volume, the command exits with an error and preserves
+namespace state and any checkouts selected with `--purge-repos`. Some containers
+and volumes may already have been removed. If another container holds the
+volume, release it and rerun the same command. Compose
 `destroy --target compose --purge` removes named volumes only and retains
 bind-mounted metastore, identity and configuration; it is not a complete reset.
 Neither clears external databases. Compose rejects redeploy --purge and
@@ -671,6 +675,17 @@ aiv query trace list --help  # Flags for a specific operation
 | `destroy` | Stop processes, remove containers. `--purge` also wipes data + state; `--purge-repos` deletes only repos `aiv` cloned. |
 | `gen` | Write the built-in blueprint to a file so you can edit it. |
 | `version` | Print the `aiv` version. |
+
+For source deployments, keep the source root and component checkouts outside the
+namespace state directory (`<workdir>/<namespace>`). Keep the workdir outside
+checkouts you intend to purge. `destroy --purge-repos` also purges state.
+Its prompt lists the verified clones. Removing a clone also removes its
+uncommitted changes and untracked files. At each checkout path declared in the
+blueprint, the CLI keeps reused worktrees, copies and clones without a
+verifiable ownership record. It also keeps an outer checkout that contains one
+of those declared checkouts. Checkout cleanup requires hard-link support on
+the checkout filesystem.
+If cleanup is interrupted, rerun the same command with the original selectors.
 
 ### Query (see [`docs/query.md`](docs/query.md))
 
