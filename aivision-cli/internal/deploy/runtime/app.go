@@ -321,7 +321,7 @@ git fetch --prune origin && git checkout %s && git reset --hard origin/%s`,
 	if err != nil {
 		return fmt.Errorf("assign ownership to cloned repo %s: %w", dir, err)
 	}
-	if err := writeRepoOwner(dir, id); err != nil {
+	if err := writeRepoOwner(dir, id, a.repoOwnerScope()); err != nil {
 		return fmt.Errorf("mark cloned repo %s: %w", dir, err)
 	}
 	if err := a.State.RecordManagedRepo(dir, id); err != nil {
@@ -336,16 +336,23 @@ func (a *App) recoverRepoRecord(dir string) {
 	if a.State == nil || a.SourceRoot() == "" {
 		return
 	}
-	id, err := repoOwnerID(dir)
+	owner, err := readRepoOwner(dir)
 	if err != nil {
+		return
+	}
+	if owner.Scope == "" || owner.Scope != a.repoOwnerScope() {
 		return
 	}
 	if err := pathguard.EnsureStrictlyWithin(a.SourceRoot(), dir); err != nil {
 		return
 	}
-	if err := a.State.RecordManagedRepo(dir, id); err != nil {
+	if err := a.State.RecordManagedRepo(dir, owner.ID); err != nil {
 		a.Log.Warn("recover ownership record for %s: %v", dir, err)
 	}
+}
+
+func (a *App) repoOwnerScope() string {
+	return filepath.Clean(a.State.Workdir) + "\x00" + a.State.Namespace
 }
 
 // ResolveEnv builds a component's effective environment: values loaded from

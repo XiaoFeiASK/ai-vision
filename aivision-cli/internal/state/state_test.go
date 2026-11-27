@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRemoveAllRejectsEscapingNamespace(t *testing.T) {
@@ -142,6 +143,46 @@ func TestConcurrentRecordManagedRepoKeepsEveryRecord(t *testing.T) {
 	}
 	if len(repos) != count {
 		t.Fatalf("records = %d, want %d: %v", len(repos), count, repos)
+	}
+}
+
+func TestRecordLockDoesNotReclaimLiveHolder(t *testing.T) {
+	s := NewState(t.TempDir(), "aivision")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.withRecordLock(func(*recordStore) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(s.lockFile(), old, old); err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan struct{})
+	go func() {
+		_ = s.withRecordLock(func(*recordStore) error {
+			close(second)
+			return nil
+		})
+	}()
+	select {
+	case <-second:
+		t.Fatal("reclaimed a lock held by a live operation")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-second:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire the released lock")
 	}
 }
 

@@ -6,10 +6,12 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -207,7 +209,19 @@ func (s *State) RemoveAll() error {
 	if err := s.VerifyPurgeTarget(); err != nil {
 		return err
 	}
-	return os.RemoveAll(s.Root)
+	store, err := s.openRecordStore(false)
+	if err != nil {
+		return err
+	}
+	if store == nil {
+		return nil
+	}
+	defer store.Close()
+	rel, err := store.rel(s.Root)
+	if err != nil {
+		return err
+	}
+	return store.root.RemoveAll(rel)
 }
 
 // ManagedRepo records a checkout aiv cloned. ID matches the ownership marker
@@ -249,14 +263,132 @@ func (s *State) VerifyRecordTargets() error {
 	return nil
 }
 
-func readManagedRepos(path string) ([]ManagedRepo, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
+// recordStore binds record operations to the directory that was validated.
+// os.Root keeps every operation inside workdir even if a path component is
+// swapped for a symlink after the check.
+type recordStore struct {
+	root    *os.Root
+	workdir string
+}
+
+func (s *State) openRecordStore(create bool) (*recordStore, error) {
+	if err := s.VerifyRecordTargets(); err != nil {
 		return nil, err
 	}
+	root, err := os.OpenRoot(s.Workdir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if !create {
+				return nil, nil
+			}
+			if err := os.MkdirAll(s.Workdir, 0o755); err != nil {
+				return nil, fmt.Errorf("create workdir %s: %w", s.Workdir, err)
+			}
+			root, err = os.OpenRoot(s.Workdir)
+		}
+		if err == nil {
+			return &recordStore{root: root, workdir: s.Workdir}, nil
+		}
+		return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
+	}
+	return &recordStore{root: root, workdir: s.Workdir}, nil
+}
+
+func (r *recordStore) Close() error { return r.root.Close() }
+
+func (r *recordStore) rel(path string) (string, error) {
+	rel, err := filepath.Rel(r.workdir, path)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s is outside %s", path, r.workdir)
+	}
+	return rel, nil
+}
+
+func (r *recordStore) readFile(path string) ([]byte, bool, error) {
+	rel, err := r.rel(path)
+	if err != nil {
+		return nil, false, err
+	}
+	f, err := r.root.Open(rel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+func (r *recordStore) remove(path string) error {
+	rel, err := r.rel(path)
+	if err != nil {
+		return err
+	}
+	if err := r.root.Remove(rel); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (r *recordStore) writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	rel, err := r.rel(path)
+	if err != nil {
+		return err
+	}
+	dirRel := filepath.Dir(rel)
+	if dirRel != "." {
+		if err := r.root.MkdirAll(dirRel, 0o755); err != nil {
+			return err
+		}
+	}
+	base := filepath.Base(rel)
+	var f *os.File
+	var tmpRel string
+	for i := 0; i < 10; i++ {
+		tmpRel = filepath.Join(dirRel, fmt.Sprintf(".%s.tmp-%d-%d", base, os.Getpid(), time.Now().UnixNano()))
+		f, err = r.root.OpenFile(tmpRel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+	if f == nil {
+		return fmt.Errorf("create temporary record for %s", path)
+	}
+	defer func() {
+		_ = f.Close()
+		_ = r.root.Remove(tmpRel)
+	}()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := r.root.Rename(tmpRel, rel); err != nil {
+		return err
+	}
+	if d, err := r.root.Open(dirRel); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+func parseManagedRepos(path string, b []byte) ([]ManagedRepo, error) {
 	var records []ManagedRepo
 	if err := json.Unmarshal(b, &records); err == nil {
 		return records, nil
@@ -276,18 +408,30 @@ func readManagedRepos(path string) ([]ManagedRepo, error) {
 // current location with the legacy in-state file so a pre-upgrade record is
 // not lost while it still exists.
 func (s *State) ManagedRepos() ([]ManagedRepo, error) {
-	return s.managedReposUnlocked()
+	store, err := s.openRecordStore(false)
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, nil
+	}
+	defer store.Close()
+	return s.managedReposFrom(store)
 }
 
-func (s *State) managedReposUnlocked() ([]ManagedRepo, error) {
+func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 	var out []ManagedRepo
 	seen := map[string]bool{}
 	seenPath := map[string]bool{}
 	for _, path := range []string{s.reposFile(), s.legacyReposFile()} {
-		if err := s.VerifyRecordTargets(); err != nil {
+		b, exists, err := store.readFile(path)
+		if err != nil {
 			return nil, err
 		}
-		records, err := readManagedRepos(path)
+		if !exists {
+			continue
+		}
+		records, err := parseManagedRepos(path, b)
 		if err != nil {
 			return nil, err
 		}
@@ -315,140 +459,77 @@ func (s *State) managedReposUnlocked() ([]ManagedRepo, error) {
 	return out, nil
 }
 
-func (s *State) writeManagedReposLocked(repos []ManagedRepo) error {
-	if err := s.VerifyRecordTargets(); err != nil {
-		return err
-	}
+func (s *State) writeManagedReposLocked(store *recordStore, repos []ManagedRepo) error {
 	path := s.reposFile()
 	if len(repos) == 0 {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := store.remove(path); err != nil {
 			return err
 		}
-		if err := s.VerifyRecordTargets(); err != nil {
-			return err
-		}
-		_ = os.Remove(s.legacyReposFile())
+		_ = store.remove(s.legacyReposFile())
 		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
 	}
 	b, err := json.MarshalIndent(repos, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := s.VerifyRecordTargets(); err != nil {
+	if err := store.writeFileAtomic(path, b, 0o644); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, b, 0o644); err != nil {
-		return err
-	}
-	if err := s.VerifyRecordTargets(); err != nil {
-		return err
-	}
-	_ = os.Remove(s.legacyReposFile())
+	_ = store.remove(s.legacyReposFile())
 	return nil
+}
+
+var recordMutexes sync.Map
+
+func (s *State) lockFile() string {
+	return filepath.Join(s.Workdir, "."+s.Namespace+".aivision-lock")
 }
 
 // withRecordLock serialises ownership-record updates across CLI processes.
 // The lock and the record file both live under workdir, outside the state
 // directory removed by --purge.
-func (s *State) withRecordLock(fn func() error) error {
-	if err := s.VerifyRecordTargets(); err != nil {
+func (s *State) withRecordLock(fn func(*recordStore) error) error {
+	store, err := s.openRecordStore(true)
+	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(s.reposFile())
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	defer store.Close()
+	lockPath := s.lockFile()
+	if err := pathguard.EnsureStrictlyWithin(s.Workdir, lockPath); err != nil {
+		return fmt.Errorf("refusing ownership record lock: %w", err)
+	}
+	lockRel, err := store.rel(lockPath)
+	if err != nil {
 		return err
 	}
-	if err := s.VerifyRecordTargets(); err != nil {
+	muAny, _ := recordMutexes.LoadOrStore(lockPath, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := acquireRecordLock(store, lockRel)
+	if err != nil {
 		return err
 	}
-	lock := filepath.Join(dir, s.Namespace+".lock")
-	if err := acquireRecordLock(lock); err != nil {
-		return err
-	}
+	dirRel, relErr := store.rel(filepath.Dir(s.reposFile()))
 	defer func() {
-		_ = os.Remove(lock)
-		_ = os.Remove(dir)
+		release()
+		if relErr == nil {
+			_ = store.root.Remove(dirRel)
+		}
 	}()
 	if err := s.VerifyRecordTargets(); err != nil {
 		return err
 	}
-	return fn()
-}
-
-func acquireRecordLock(path string) error {
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		err := os.Mkdir(path, 0o700)
-		if err == nil {
-			return nil
-		}
-		if os.IsNotExist(err) {
-			if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
-				return mkErr
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("timed out waiting for ownership record lock %s", path)
-			}
-			continue
-		}
-		if !os.IsExist(err) {
-			return err
-		}
-		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 2*time.Minute {
-			if os.RemoveAll(path) == nil {
-				continue
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for ownership record lock %s", path)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err := f.Chmod(perm); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
+	return fn(store)
 }
 
 func (s *State) updateManagedRepos(mutate func([]ManagedRepo) []ManagedRepo) error {
-	return s.withRecordLock(func() error {
-		repos, err := s.managedReposUnlocked()
+	return s.withRecordLock(func(store *recordStore) error {
+		repos, err := s.managedReposFrom(store)
 		if err != nil {
 			return err
 		}
-		return s.writeManagedReposLocked(mutate(repos))
+		return s.writeManagedReposLocked(store, mutate(repos))
 	})
 }
 

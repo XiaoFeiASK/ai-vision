@@ -373,6 +373,63 @@ func TestDestroyPurgeReposPreservesReplacementCheckout(t *testing.T) {
 	}
 }
 
+func TestDestroyPurgeReposRetiresCompletedPendingForReplacement(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "old-id", "old-id")
+	if err := app.State.SetRepoPending(cloned, "old-id", true); err != nil {
+		t.Fatal(err)
+	}
+	// The old checkout is gone and no tombstone remains: deletion completed.
+	if err := os.RemoveAll(cloned); err != nil {
+		t.Fatal(err)
+	}
+	makeClone(t, app, cloned, "new-id", "new-id")
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cloned, "file")); err != nil {
+		t.Fatalf("replacement checkout was removed: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || repos[0].ID != "new-id" || repos[0].Pending {
+		t.Fatalf("records after retiring the completed removal = %v", repos)
+	}
+}
+
+func TestPurgePreviewExcludesRemovalPathConflict(t *testing.T) {
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+	if err := os.MkdirAll(filepath.Join(tombstone, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := app.PurgeRepoPreview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preview) != 0 {
+		t.Fatalf("preview listed a candidate with a removal-path conflict: %v", preview)
+	}
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cloned, "file")); err != nil {
+		t.Fatalf("checkout was removed despite the conflict: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tombstone, "keep")); err != nil {
+		t.Fatalf("conflicting directory was removed: %v", err)
+	}
+}
+
 func TestDestroyPurgeReposPreservesUnmarkedPendingTombstone(t *testing.T) {
 	sourceRoot := t.TempDir()
 	cloned := filepath.Join(sourceRoot, "cloned")

@@ -136,14 +136,14 @@ func TestReusedCheckoutRecoversMissingRecord(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeRepoOwner(checkout, "recovered-id"); err != nil {
-		t.Fatal(err)
-	}
 	app := &App{
 		Log:   NewLogger(false),
 		Ctx:   context.Background(),
 		State: NewState(filepath.Join(root, "work"), "aivision"),
 		Vars:  map[string]string{"SOURCE_ROOT": sourceRoot},
+	}
+	if err := writeRepoOwner(checkout, "recovered-id", app.repoOwnerScope()); err != nil {
+		t.Fatal(err)
 	}
 	component := Component{Name: "backend", Repo: &blueprint.Repo{
 		URL: "https://example.invalid/repo.git", Branch: "main", Path: "backend",
@@ -157,5 +157,36 @@ func TestReusedCheckoutRecoversMissingRecord(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0].Path != checkout || repos[0].ID != "recovered-id" {
 		t.Fatalf("recovered records = %v", repos)
+	}
+}
+
+func TestReusedCheckoutDoesNotRecoverForeignRegistration(t *testing.T) {
+	root := t.TempDir()
+	sourceRoot := filepath.Join(root, "src")
+	checkout := filepath.Join(sourceRoot, "backend")
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{
+		Log:   NewLogger(false),
+		Ctx:   context.Background(),
+		State: NewState(filepath.Join(root, "work"), "other-namespace"),
+		Vars:  map[string]string{"SOURCE_ROOT": sourceRoot},
+	}
+	if err := writeRepoOwner(checkout, "foreign-id", "another-workdir\x00another-namespace"); err != nil {
+		t.Fatal(err)
+	}
+	component := Component{Name: "backend", Repo: &blueprint.Repo{
+		URL: "https://example.invalid/repo.git", Branch: "main", Path: "backend",
+	}}
+	if err := app.gitCloneOrFetch(component); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("foreign checkout was recorded: %v", repos)
 	}
 }

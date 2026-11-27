@@ -56,6 +56,12 @@ func (a *App) Destroy(opts DestroyOpts) error {
 				return fmt.Errorf("forget removed repo %s: %w", dir, err)
 			}
 		}
+		for _, repo := range repoPlan.retire {
+			a.Log.Info("retiring completed pending removal %s", repo.Path)
+			if err := a.State.ForgetManagedRepoID(repo.Path, repo.ID); err != nil {
+				return fmt.Errorf("retire pending removal %s: %w", repo.Path, err)
+			}
+		}
 	}
 
 	comps := a.BP.OrderedComponents()
@@ -138,6 +144,7 @@ func (a *App) Destroy(opts DestroyOpts) error {
 type repoPurgePlan struct {
 	candidates []ManagedRepo
 	orphans    []string
+	retire     []ManagedRepo
 	kept       []string
 }
 
@@ -174,7 +181,7 @@ func confirmedRepoPlan(plan repoPurgePlan, confirmed []ManagedRepo) repoPurgePla
 		want[repoKey(repo)] = true
 		wantPath[repo.Path] = true
 	}
-	out := repoPurgePlan{kept: plan.kept}
+	out := repoPurgePlan{kept: plan.kept, retire: plan.retire}
 	matched := map[string]bool{}
 	orphanPath := map[string]bool{}
 	for _, repo := range plan.candidates {
@@ -267,6 +274,20 @@ func (a *App) repoPurgePlan() (repoPurgePlan, error) {
 			plan.kept = append(plan.kept, repo.Path+" ("+err.Error()+")")
 			continue
 		}
+		if _, err := os.Lstat(tombstone); err == nil {
+			plan.kept = append(plan.kept, repo.Path+" (removal path already exists)")
+			continue
+		} else if !os.IsNotExist(err) {
+			return plan, fmt.Errorf("inspect pending removal %s: %w", tombstone, err)
+		}
+		if _, err := os.Lstat(purgeMarkerPath(tombstone)); err == nil {
+			if !purgeMarkerMatches(tombstone, repo) {
+				plan.kept = append(plan.kept, repo.Path+" (removal marker belongs to another record)")
+				continue
+			}
+		} else if !os.IsNotExist(err) {
+			return plan, fmt.Errorf("inspect removal marker %s: %w", purgeMarkerPath(tombstone), err)
+		}
 		plan.candidates = append(plan.candidates, repo)
 	}
 	return plan, nil
@@ -285,7 +306,9 @@ func (a *App) addPendingCandidate(plan *repoPurgePlan, repo ManagedRepo, tombsto
 	}
 	if _, err := os.Lstat(repo.Path); err == nil {
 		if err := verifyRepoOwner(repo.Path, repo.ID); err != nil {
-			plan.kept = append(plan.kept, repo.Path+" (pending removal cannot verify the checkout)")
+			// The tombstone is gone but the path belongs to another checkout:
+			// the removal completed and the stale pending record can be retired.
+			plan.retire = append(plan.retire, repo)
 			return nil
 		}
 	} else if !os.IsNotExist(err) {
@@ -502,7 +525,10 @@ func (a *App) finishPendingRemoval(repo ManagedRepo, tombstone string) error {
 		return fmt.Errorf("inspect pending removal %s: %w", tombstone, err)
 	} else if _, err := os.Lstat(dir); err == nil {
 		if err := verifyRepoOwner(dir, repo.ID); err != nil {
-			a.Log.Warn("keeping repo %s: pending removal cannot verify ownership: %v", dir, err)
+			a.Log.Info("retiring completed pending removal %s", dir)
+			if err := a.State.ForgetManagedRepoID(dir, repo.ID); err != nil {
+				return fmt.Errorf("retire pending removal %s: %w", dir, err)
+			}
 			return nil
 		}
 		a.Log.Info("resuming removal of %s", dir)
