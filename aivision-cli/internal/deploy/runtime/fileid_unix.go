@@ -3,12 +3,11 @@
 package runtime
 
 import (
-	"os"
 	"syscall"
 )
 
-func fileIdentity(path string) (dev, ino uint64, ok bool) {
-	info, err := os.Stat(path)
+func (f *repoFS) identity(path string) (dev, ino uint64, ok bool) {
+	info, err := f.lstat(path)
 	if err != nil {
 		return 0, 0, false
 	}

@@ -4,6 +4,8 @@
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -209,19 +211,22 @@ func (s *State) RemoveAll() error {
 	if err := s.VerifyPurgeTarget(); err != nil {
 		return err
 	}
-	store, err := s.openRecordStore(false)
+	workRoot, err := os.OpenRoot(s.Workdir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer workRoot.Close()
+	rel, err := filepath.Rel(s.Workdir, s.Root)
 	if err != nil {
 		return err
 	}
-	if store == nil {
-		return nil
+	if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s is outside %s", s.Root, s.Workdir)
 	}
-	defer store.Close()
-	rel, err := store.rel(s.Root)
-	if err != nil {
-		return err
-	}
-	return store.root.RemoveAll(rel)
+	return workRoot.RemoveAll(rel)
 }
 
 // ManagedRepo records a checkout aiv cloned. ID matches the ownership marker
@@ -237,12 +242,23 @@ type ManagedRepo struct {
 // reposFile lives outside the namespace root so a state-only --purge keeps
 // the ownership records needed by a later --purge-repos.
 func (s *State) reposFile() string {
-	return filepath.Join(s.Workdir, ".aivision-repos", s.Namespace+".json")
+	return filepath.Join(s.Workdir, ".aivision-repos", namespaceKey(s.Namespace)+".json")
+}
+
+func namespaceKey(namespace string) string {
+	sum := sha256.Sum256([]byte(namespace))
+	return hex.EncodeToString(sum[:8])
 }
 
 // legacyReposFile is the record location used before records moved out of the
 // purgeable state directory.
 func (s *State) legacyReposFile() string { return filepath.Join(s.StateDir, "repos.json") }
+
+// namedReposFile is the pre-hash record name. It stays readable so an
+// upgrade does not lose the ownership records of existing clones.
+func (s *State) namedReposFile() string {
+	return filepath.Join(s.recordDir(), s.Namespace+".json")
+}
 
 // VerifyRecordTargets keeps both record locations inside their intended
 // storage: current records inside workdir, legacy records inside the state
@@ -263,56 +279,126 @@ func (s *State) VerifyRecordTargets() error {
 	return nil
 }
 
-// recordStore binds record operations to the directory that was validated.
-// os.Root keeps every operation inside workdir even if a path component is
-// swapped for a symlink after the check.
+// recordStore binds record operations to the per-deployment record directory
+// that was validated. os.Root keeps every operation inside it even if a path
+// component is swapped for a symlink after the check.
 type recordStore struct {
-	root    *os.Root
+	root    *os.Root // <workdir>/.aivision-repos; nil when it does not exist
+	work    *os.Root // workdir
+	base    string
 	workdir string
 }
+
+func (s *State) recordDir() string { return filepath.Join(s.Workdir, ".aivision-repos") }
 
 func (s *State) openRecordStore(create bool) (*recordStore, error) {
 	if err := s.VerifyRecordTargets(); err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(s.Workdir)
+	work, err := os.OpenRoot(s.Workdir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			if !create {
-				return nil, nil
-			}
-			if err := os.MkdirAll(s.Workdir, 0o755); err != nil {
-				return nil, fmt.Errorf("create workdir %s: %w", s.Workdir, err)
-			}
-			root, err = os.OpenRoot(s.Workdir)
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
 		}
-		if err == nil {
-			return &recordStore{root: root, workdir: s.Workdir}, nil
+		if !create {
+			return nil, nil
 		}
-		return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
+		if err := os.MkdirAll(s.Workdir, 0o755); err != nil {
+			return nil, fmt.Errorf("create workdir %s: %w", s.Workdir, err)
+		}
+		if work, err = os.OpenRoot(s.Workdir); err != nil {
+			return nil, fmt.Errorf("open workdir %s: %w", s.Workdir, err)
+		}
 	}
-	return &recordStore{root: root, workdir: s.Workdir}, nil
+	store := &recordStore{work: work, workdir: s.Workdir, base: s.recordDir()}
+	rel, err := store.workRel(store.base)
+	if err != nil {
+		_ = work.Close()
+		return nil, err
+	}
+	info, err := work.Lstat(rel)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			_ = work.Close()
+			return nil, fmt.Errorf("record directory %s is not a regular directory", store.base)
+		}
+	} else if os.IsNotExist(err) {
+		if !create {
+			return store, nil
+		}
+		if err := work.Mkdir(rel, 0o755); err != nil {
+			if !os.IsExist(err) {
+				_ = work.Close()
+				return nil, fmt.Errorf("create record directory %s: %w", store.base, err)
+			}
+			info, statErr := work.Lstat(rel)
+			if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				_ = work.Close()
+				return nil, fmt.Errorf("record directory %s is not a regular directory", store.base)
+			}
+		}
+	} else {
+		_ = work.Close()
+		return nil, fmt.Errorf("inspect record directory %s: %w", store.base, err)
+	}
+	root, err := work.OpenRoot(rel)
+	if err != nil {
+		_ = work.Close()
+		return nil, fmt.Errorf("open record directory %s: %w", store.base, err)
+	}
+	store.root = root
+	return store, nil
 }
 
-func (r *recordStore) Close() error { return r.root.Close() }
+func (r *recordStore) Close() error {
+	if r.root != nil {
+		_ = r.root.Close()
+	}
+	return r.work.Close()
+}
 
-func (r *recordStore) rel(path string) (string, error) {
-	rel, err := filepath.Rel(r.workdir, path)
+func relWithin(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
 	if err != nil {
 		return "", err
 	}
 	if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%s is outside %s", path, r.workdir)
+		return "", fmt.Errorf("%s is outside %s", path, root)
 	}
 	return rel, nil
 }
 
+func (r *recordStore) rel(path string) (string, error) { return relWithin(r.base, path) }
+
+func (r *recordStore) workRel(path string) (string, error) {
+	return relWithin(r.workdir, path)
+}
+
 func (r *recordStore) readFile(path string) ([]byte, bool, error) {
+	if r.root == nil {
+		return nil, false, nil
+	}
 	rel, err := r.rel(path)
 	if err != nil {
 		return nil, false, err
 	}
-	f, err := r.root.Open(rel)
+	b, err := r.root.ReadFile(rel)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+// readWorkFile reads the legacy record that predates the record directory.
+func (r *recordStore) readWorkFile(path string) ([]byte, bool, error) {
+	rel, err := r.workRel(path)
+	if err != nil {
+		return nil, false, err
+	}
+	f, err := r.work.Open(rel)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
@@ -328,11 +414,25 @@ func (r *recordStore) readFile(path string) ([]byte, bool, error) {
 }
 
 func (r *recordStore) remove(path string) error {
+	if r.root == nil {
+		return nil
+	}
 	rel, err := r.rel(path)
 	if err != nil {
 		return err
 	}
 	if err := r.root.Remove(rel); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (r *recordStore) removeWork(path string) error {
+	rel, err := r.workRel(path)
+	if err != nil {
+		return err
+	}
+	if err := r.work.Remove(rel); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -423,22 +523,15 @@ func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 	var out []ManagedRepo
 	seen := map[string]bool{}
 	seenPath := map[string]bool{}
-	for _, path := range []string{s.reposFile(), s.legacyReposFile()} {
-		b, exists, err := store.readFile(path)
-		if err != nil {
-			return nil, err
-		}
-		if !exists {
-			continue
-		}
+	add := func(path string, b []byte) error {
 		records, err := parseManagedRepos(path, b)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, record := range records {
 			dir, err := filepath.Abs(record.Path)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			record.Path = filepath.Clean(dir)
 			key := record.Path + "\x00" + record.ID
@@ -455,6 +548,31 @@ func (s *State) managedReposFrom(store *recordStore) ([]ManagedRepo, error) {
 			seenPath[record.Path] = true
 			out = append(out, record)
 		}
+		return nil
+	}
+	named := s.namedReposFile()
+	type repoSource struct {
+		path string
+		read func(string) ([]byte, bool, error)
+	}
+	sources := []repoSource{
+		{s.reposFile(), store.readFile},
+		{s.legacyReposFile(), store.readWorkFile},
+	}
+	if _, err := store.rel(named); err == nil {
+		sources = append(sources, repoSource{named, store.readFile})
+	}
+	for _, source := range sources {
+		b, exists, err := source.read(source.path)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			continue
+		}
+		if err := add(source.path, b); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -465,7 +583,8 @@ func (s *State) writeManagedReposLocked(store *recordStore, repos []ManagedRepo)
 		if err := store.remove(path); err != nil {
 			return err
 		}
-		_ = store.remove(s.legacyReposFile())
+		s.removeNamedRepos(store)
+		_ = store.removeWork(s.legacyReposFile())
 		return nil
 	}
 	b, err := json.MarshalIndent(repos, "", "  ")
@@ -475,14 +594,22 @@ func (s *State) writeManagedReposLocked(store *recordStore, repos []ManagedRepo)
 	if err := store.writeFileAtomic(path, b, 0o644); err != nil {
 		return err
 	}
-	_ = store.remove(s.legacyReposFile())
+	s.removeNamedRepos(store)
+	_ = store.removeWork(s.legacyReposFile())
 	return nil
+}
+
+func (s *State) removeNamedRepos(store *recordStore) {
+	path := s.namedReposFile()
+	if _, err := store.rel(path); err == nil {
+		_ = store.remove(path)
+	}
 }
 
 var recordMutexes sync.Map
 
 func (s *State) lockFile() string {
-	return filepath.Join(s.Workdir, "."+s.Namespace+".aivision-lock")
+	return filepath.Join(s.Workdir, ".aivision-"+namespaceKey(s.Namespace)+".lock")
 }
 
 // withRecordLock serialises ownership-record updates across CLI processes.
@@ -498,7 +625,7 @@ func (s *State) withRecordLock(fn func(*recordStore) error) error {
 	if err := pathguard.EnsureStrictlyWithin(s.Workdir, lockPath); err != nil {
 		return fmt.Errorf("refusing ownership record lock: %w", err)
 	}
-	lockRel, err := store.rel(lockPath)
+	lockRel, err := store.workRel(lockPath)
 	if err != nil {
 		return err
 	}
@@ -510,17 +637,56 @@ func (s *State) withRecordLock(fn func(*recordStore) error) error {
 	if err != nil {
 		return err
 	}
-	dirRel, relErr := store.rel(filepath.Dir(s.reposFile()))
+	dirRel, relErr := store.workRel(store.base)
 	defer func() {
 		release()
+		if store.root != nil {
+			_ = store.root.Close()
+			store.root = nil
+		}
 		if relErr == nil {
-			_ = store.root.Remove(dirRel)
+			_ = store.work.Remove(dirRel)
 		}
 	}()
 	if err := s.VerifyRecordTargets(); err != nil {
 		return err
 	}
 	return fn(store)
+}
+
+// AcquireRepoRemovalLock serialises removal of one recorded checkout across
+// CLI processes. The lock file lives in workdir, not in the state directory or
+// the record directory, so it survives --purge and never blocks record cleanup.
+func (s *State) AcquireRepoRemovalLock(dir, id string) (func(), error) {
+	store, err := s.openRecordStore(true)
+	if err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(abs) + "\x00" + id))
+	lockPath := filepath.Join(s.Workdir, ".aivision-removal-"+hex.EncodeToString(sum[:8])+".lock")
+	if err := pathguard.EnsureStrictlyWithin(s.Workdir, lockPath); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("refusing repo removal lock: %w", err)
+	}
+	rel, err := store.workRel(lockPath)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	release, err := acquireRecordLock(store, rel)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return func() {
+		release()
+		_ = store.Close()
+	}, nil
 }
 
 func (s *State) updateManagedRepos(mutate func([]ManagedRepo) []ManagedRepo) error {
@@ -634,4 +800,52 @@ func (s *State) SetRepoPending(dir, id string, pending bool) error {
 		return fmt.Errorf("ownership record for %s is missing", dir)
 	}
 	return nil
+}
+
+// ClaimRepoPending transitions an active record to pending. It returns false
+// when another invocation already claimed it or the record disappeared.
+func (s *State) ClaimRepoPending(dir, id string) (bool, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	abs = filepath.Clean(abs)
+	claimed := false
+	err = s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		for i := range repos {
+			if repos[i].Path != abs || repos[i].ID != id {
+				continue
+			}
+			if !repos[i].Pending {
+				repos[i].Pending = true
+				claimed = true
+			}
+			return repos
+		}
+		return repos
+	})
+	return claimed, err
+}
+
+// ForgetManagedRepoIDIfActive removes one record only if no removal has been
+// claimed since the caller read it.
+func (s *State) ForgetManagedRepoIDIfActive(dir, id string) (bool, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+	abs = filepath.Clean(abs)
+	removed := false
+	err = s.updateManagedRepos(func(repos []ManagedRepo) []ManagedRepo {
+		kept := make([]ManagedRepo, 0, len(repos))
+		for _, repo := range repos {
+			if repo.Path == abs && repo.ID == id && !repo.Pending {
+				removed = true
+				continue
+			}
+			kept = append(kept, repo)
+		}
+		return kept
+	})
+	return removed, err
 }

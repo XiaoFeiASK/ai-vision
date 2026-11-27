@@ -200,6 +200,47 @@ components:
 	}
 }
 
+func TestDestroyPurgeIgnoresUnavailableRecordStorage(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "teardown-ran")
+	state := runtime.NewState(dir, "aivision")
+	if err := state.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(dir, ".aivision-repos")
+	if err := os.WriteFile(blocker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bpPath := filepath.Join(dir, "blueprint.yaml")
+	content := fmt.Sprintf(`metadata: {name: record-storage, namespace: aivision}
+config:
+  workdir: %s
+  sourceRoot: %s
+components:
+  - name: demo
+    kind: process
+    run: "true"
+    teardown:
+      - shell: "touch %s"
+`, dir, dir, marker)
+	if err := os.WriteFile(bpPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cmdDestroy([]string{"--file", bpPath, "--workdir", dir, "--namespace", "aivision", "--purge", "-y"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("teardown did not run: %v", err)
+	}
+	if _, err := os.Stat(state.Root); !os.IsNotExist(err) {
+		t.Fatalf("state directory survived the purge: %v", err)
+	}
+	if data, err := os.ReadFile(blocker); err != nil || string(data) != "keep" {
+		t.Fatalf("unrelated record path changed: %q, %v", data, err)
+	}
+}
+
 func TestDestroyStatePreflightRefusesBeforeVolumeRemoval(t *testing.T) {
 	workdir := t.TempDir()
 	sourceRoot := t.TempDir()

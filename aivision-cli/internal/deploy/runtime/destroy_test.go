@@ -1,12 +1,15 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newDestroyTestApp(t *testing.T, workdir, sourceRoot string, repos ...Repo) *App {
@@ -53,6 +56,18 @@ func makeClone(t *testing.T, app *App, dir, recordedID, markerID string) {
 		if err := app.State.RecordManagedRepo(dir, recordedID); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func writeTestPurgeMarker(t *testing.T, sourceRoot, tombstone string, repo ManagedRepo) {
+	t.Helper()
+	fs, err := openRepoFS(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	if err := fs.writePurgeMarker(tombstone, repo); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -259,9 +274,7 @@ func TestDestroyPurgeReposFinishesInterruptedRemoval(t *testing.T) {
 	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := writePurgeMarker(tombstone, ManagedRepo{Path: cloned, ID: "owner-id"}); err != nil {
-		t.Fatal(err)
-	}
+	writeTestPurgeMarker(t, sourceRoot, tombstone, ManagedRepo{Path: cloned, ID: "owner-id"})
 	if err := os.Rename(cloned, tombstone); err != nil {
 		t.Fatal(err)
 	}
@@ -347,9 +360,7 @@ func TestDestroyPurgeReposPreservesReplacementCheckout(t *testing.T) {
 	if err := app.State.SetRepoPending(cloned, "old-id", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := writePurgeMarker(tombstone, ManagedRepo{Path: cloned, ID: "old-id"}); err != nil {
-		t.Fatal(err)
-	}
+	writeTestPurgeMarker(t, sourceRoot, tombstone, ManagedRepo{Path: cloned, ID: "old-id"})
 	if err := os.Rename(cloned, tombstone); err != nil {
 		t.Fatal(err)
 	}
@@ -399,6 +410,254 @@ func TestDestroyPurgeReposRetiresCompletedPendingForReplacement(t *testing.T) {
 	}
 	if len(repos) != 1 || repos[0].ID != "new-id" || repos[0].Pending {
 		t.Fatalf("records after retiring the completed removal = %v", repos)
+	}
+}
+
+func TestDestroyPurgeReposKeepsPendingOnInconclusiveOwnership(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission-based ownership failure does not apply to root")
+	}
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(cloned, ".git")
+	if err := os.Chmod(gitDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755) })
+
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err == nil {
+		t.Fatal("destroy retired a pending record without readable ownership evidence")
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 1 || !repos[0].Pending {
+		t.Fatalf("pending record was not preserved: %v, %v", repos, err)
+	}
+}
+
+func TestConcurrentDestroyKeepsPendingRemoval(t *testing.T) {
+	workdir := t.TempDir()
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, workdir, sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	repo := ManagedRepo{Path: cloned, ID: "owner-id"}
+
+	// Another invocation claimed the removal and was interrupted after the
+	// rename, before the tombstone was deleted.
+	if err := app.State.SetRepoPending(cloned, "owner-id", true); err != nil {
+		t.Fatal(err)
+	}
+	tombstone := app.purgeTombstone(repo)
+	writeTestPurgeMarker(t, sourceRoot, tombstone, repo)
+	if err := os.Rename(cloned, tombstone); err != nil {
+		t.Fatal(err)
+	}
+
+	// This invocation still holds a plan that saw the checkout as active.
+	fs, err := openRepoFS(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	if err := app.cleanupRepoRecords(fs, repoPurgePlan{orphans: []ManagedRepo{repo}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.removeManagedRepos(fs, []ManagedRepo{repo}); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("stale plan left the pending record behind: %v", repos)
+	}
+	if _, err := os.Stat(tombstone); !os.IsNotExist(err) {
+		t.Fatalf("pending record was retired while its tombstone survived: %v", err)
+	}
+
+	// The follow-up is idempotent.
+	if err := app.Destroy(DestroyOpts{PurgeRepos: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(tombstone); !os.IsNotExist(err) {
+		t.Fatalf("tombstone survived the retry: %v", err)
+	}
+	repos, err = app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("record survived the retry: %v, %v", repos, err)
+	}
+}
+
+func TestDestroySubprocessHelper(t *testing.T) {
+	if os.Getenv("AIV_DESTROY_HELPER") != "1" {
+		return
+	}
+	workdir := os.Getenv("AIV_HELPER_WORKDIR")
+	sourceRoot := os.Getenv("AIV_HELPER_SOURCE")
+	cloned := os.Getenv("AIV_HELPER_CLONE")
+	repo := ManagedRepo{Path: cloned, ID: "owner-id"}
+	app := newDestroyTestApp(t, workdir, sourceRoot)
+	release, err := app.State.AcquireRepoRemovalLock(repo.Path, repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	claimed, err := app.State.ClaimRepoPending(repo.Path, repo.ID)
+	if err != nil || !claimed {
+		t.Fatalf("claim pending = %v, %v", claimed, err)
+	}
+	fs, err := openRepoFS(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	tombstone := app.purgeTombstone(repo)
+	if err := fs.writePurgeMarker(tombstone, repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.rename(repo.Path, tombstone); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(os.Getenv("AIV_HELPER_READY"), []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(os.Getenv("AIV_HELPER_RELEASE")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the parent to release the helper")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Leave the pending record and tombstone behind, as an interrupted
+	// invocation would.
+	release()
+	os.Exit(0)
+}
+
+func TestDestroyConcurrentProcessFinishesPendingRemoval(t *testing.T) {
+	workdir := t.TempDir()
+	sourceRoot := t.TempDir()
+	cloned := filepath.Join(sourceRoot, "cloned")
+	app := newDestroyTestApp(t, workdir, sourceRoot, Repo{Path: "cloned"})
+	makeClone(t, app, cloned, "owner-id", "owner-id")
+	tombstone := app.purgeTombstone(ManagedRepo{Path: cloned, ID: "owner-id"})
+
+	signals := t.TempDir()
+	ready := filepath.Join(signals, "ready")
+	releasePath := filepath.Join(signals, "release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDestroySubprocessHelper$")
+	cmd.Env = append(os.Environ(),
+		"AIV_DESTROY_HELPER=1",
+		"AIV_HELPER_WORKDIR="+workdir,
+		"AIV_HELPER_SOURCE="+sourceRoot,
+		"AIV_HELPER_CLONE="+cloned,
+		"AIV_HELPER_READY="+ready,
+		"AIV_HELPER_RELEASE="+releasePath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	defer func() {
+		if !waited {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			waited = true
+			t.Fatalf("helper did not reach the interrupted state: %s", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- app.Destroy(DestroyOpts{PurgeRepos: true}) }()
+	select {
+	case err := <-errCh:
+		t.Fatalf("destroy finished while another process held the removal lock: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if err := os.WriteFile(releasePath, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		waited = true
+		t.Fatalf("helper failed: %v\n%s", err, stderr.String())
+	}
+	waited = true
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("destroy did not resume after the helper released the lock")
+	}
+	if _, err := os.Stat(cloned); !os.IsNotExist(err) {
+		t.Fatalf("checkout survived: %v", err)
+	}
+	if _, err := os.Stat(tombstone); !os.IsNotExist(err) {
+		t.Fatalf("pending removal survived: %v", err)
+	}
+	repos, err := app.State.ManagedRepos()
+	if err != nil || len(repos) != 0 {
+		t.Fatalf("record survived: %v, %v", repos, err)
+	}
+}
+
+func TestRepoFSRefusesSwappedSymlink(t *testing.T) {
+	sourceRoot := t.TempDir()
+	victim := t.TempDir()
+	if err := os.WriteFile(filepath.Join(victim, "keep"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(sourceRoot, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := openRepoFS(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	if err := os.Remove(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, child); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := fs.removeAll(child); err == nil {
+		t.Fatal("removal followed a symlink outside the source root")
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keep")); err != nil {
+		t.Fatalf("directory outside the source root was removed: %v", err)
+	}
+}
+
+func TestDestroyPurgeReposToleratesMissingSourceRoot(t *testing.T) {
+	sourceRoot := filepath.Join(t.TempDir(), "missing")
+	app := newDestroyTestApp(t, t.TempDir(), sourceRoot)
+	if err := app.Destroy(DestroyOpts{Purge: true, PurgeRepos: true}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -465,9 +724,7 @@ func TestDestroyPurgeReposKeepsTombstoneWhenRenameNeverHappened(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Crash window: the marker is durable but the rename has not run yet.
-	if err := writePurgeMarker(tombstone, repo); err != nil {
-		t.Fatal(err)
-	}
+	writeTestPurgeMarker(t, sourceRoot, tombstone, repo)
 	if err := os.MkdirAll(filepath.Join(tombstone, "keep"), 0o755); err != nil {
 		t.Fatal(err)
 	}

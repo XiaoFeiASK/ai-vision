@@ -14,7 +14,7 @@ import (
 // automatically when the process exits. A live holder therefore cannot lose
 // its lock because of an old timestamp, and there is no stale lock to reclaim.
 func acquireRecordLock(store *recordStore, rel string) (func(), error) {
-	f, err := store.root.OpenFile(rel, os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := store.work.OpenFile(rel, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}

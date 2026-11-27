@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +187,46 @@ func TestRecordLockDoesNotReclaimLiveHolder(t *testing.T) {
 	}
 }
 
+func TestLongNamespaceUsesBoundedRecordAndLockNames(t *testing.T) {
+	namespace := strings.Repeat("a", 240)
+	s := NewState(t.TempDir(), namespace)
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := s.RecordManagedRepo(repo, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if name := filepath.Base(s.reposFile()); len(name) > 64 {
+		t.Fatalf("record filename is not bounded: %d bytes", len(name))
+	}
+	if name := filepath.Base(s.lockFile()); len(name) > 64 {
+		t.Fatalf("lock filename is not bounded: %d bytes", len(name))
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].Path != repo {
+		t.Fatalf("records with a long namespace = %v, %v", repos, err)
+	}
+}
+
+func TestRemoveAllDoesNotDependOnRecordStorage(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := s.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(workdir, ".aivision-repos")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveAll(); err != nil {
+		t.Fatalf("state-only purge depended on record storage: %v", err)
+	}
+	if _, err := os.Stat(s.Root); !os.IsNotExist(err) {
+		t.Fatalf("state root still exists: %v", err)
+	}
+	if _, err := os.Stat(blocker); err != nil {
+		t.Fatalf("unrelated record path was modified: %v", err)
+	}
+}
+
 func TestManagedReposSurviveStatePurge(t *testing.T) {
 	workdir := t.TempDir()
 	s := NewState(workdir, "aivision")
@@ -238,6 +279,38 @@ func TestManagedReposReadsLegacyRecord(t *testing.T) {
 	}
 	if _, err := os.Stat(s.legacyReposFile()); !os.IsNotExist(err) {
 		t.Fatalf("legacy record file was not migrated: %v", err)
+	}
+}
+
+func TestManagedReposReadsNamedRecord(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := os.MkdirAll(s.recordDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "repo")
+	named, err := json.Marshal([]ManagedRepo{{Path: dir, ID: "old-id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.namedReposFile(), named, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repos, err := s.ManagedRepos()
+	if err != nil || len(repos) != 1 || repos[0].ID != "old-id" {
+		t.Fatalf("named records = %v, %v", repos, err)
+	}
+
+	other := filepath.Join(t.TempDir(), "other")
+	if err := s.RecordManagedRepo(other, "new-id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(s.namedReposFile()); !os.IsNotExist(err) {
+		t.Fatalf("named record file was not migrated: %v", err)
+	}
+	repos, err = s.ManagedRepos()
+	if err != nil || len(repos) != 2 {
+		t.Fatalf("records after migration = %v, %v", repos, err)
 	}
 }
 
@@ -310,5 +383,48 @@ func TestRecordTargetsRejectSymlinkedStorageWithoutWriting(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("out-of-scope directory was modified: %v", entries)
+	}
+}
+
+func TestRecordStoreStaysBoundToOpenedRecordDirectory(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	store, err := s.openRecordStore(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	moved := s.recordDir() + "-moved"
+	if err := os.Rename(s.recordDir(), moved); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, s.recordDir()); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := store.writeFileAtomic(s.reposFile(), []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, filepath.Base(s.reposFile()))); err != nil {
+		t.Fatalf("record was not written through the opened directory: %v", err)
+	}
+	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
+		t.Fatalf("record escaped through the replaced path: %v, %v", entries, err)
+	}
+}
+
+func TestRecordStorageUnavailableFailsClosed(t *testing.T) {
+	workdir := t.TempDir()
+	s := NewState(workdir, "aivision")
+	if err := os.WriteFile(s.recordDir(), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordManagedRepo(filepath.Join(t.TempDir(), "repo"), "id"); err == nil {
+		t.Fatal("RecordManagedRepo wrote through a non-directory record path")
+	}
+	data, err := os.ReadFile(s.recordDir())
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("unrelated record path changed: %q, %v", data, err)
 	}
 }
